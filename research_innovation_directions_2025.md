@@ -528,3 +528,577 @@ results_sp_imp_dpmn_adaptive_fix/score_components/sp_imp_dpmn/*.mat
 results_sp_imp_dpmn_adaptive_fix/mask_history/sp_imp_dpmn/*.mat
 ```
 
+## 10. Next Optimization Plan After Adaptive Fusion
+
+Date: 2026-06-11.
+
+Current status after pushing commit `cf5511b`:
+
+```text
+Full tuned SP-IMP-DPMN mean_auc: 0.916926731476
+Adaptive-fusion targeted rerun:
+  abu_beach_2: 0.838357343083 -> 0.874754193117
+  abu_urban_2: 0.639632366192 -> 0.992577204738
+Projected full mean after replacing these two samples: 0.942882844048
+```
+
+Interpretation:
+
+- SP-IMP-DPMN is now close to the historical strong baseline range.
+- The largest observed issue was not reconstruction loss itself, but score fusion instability.
+- `abu_urban_2` had excellent residual and contrast scores, but abundance uncertainty was nearly inverted and damaged fusion.
+- Adaptive fusion fixed this without hard-coding sample names.
+
+Recommended next sequence:
+
+1. Full rerun with adaptive fusion enabled to get the true full mean AUC.
+2. Add localization-oriented metrics: AUPR, precision@K, and IoU@bestF1.
+3. Add a wavelet high-frequency residual score without changing the main network.
+4. Consider integrating error-adaptive convolution into AGM/DPMN afterward.
+
+Rationale by step:
+
+### Step 1: Full adaptive-fusion rerun
+
+The current `0.9429` is a projected value from replacing two weak samples. A full rerun is needed for a clean comparison because DIP-style optimization has run-to-run variation.
+
+Target command:
+
+```bash
+python train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_adaptive_full
+```
+
+### Step 2: Add localization metrics
+
+AUC is ranking-oriented and does not fully describe localization quality. For hyperspectral anomaly detection, especially tiny targets, the following metrics are useful:
+
+```text
+AUPR
+precision@K, where K is the number of ground-truth anomaly pixels
+IoU@bestF1
+best F1 threshold
+```
+
+These should be saved in the batch CSV and batch summary alongside ROC-AUC.
+
+### Step 3: Add wavelet high-frequency residual score
+
+The remaining weak sample `abu_beach_2` suggests that residual and contrast may not fully capture local frequency/edge anomaly evidence. Recent frequency and wavelet HAD work argues that anomalies and backgrounds separate better when low-frequency background and high-frequency details are modeled separately.
+
+A lightweight implementation should not alter the DPMN backbone first. Instead:
+
+```text
+residual map = ||X - B||
+high-frequency residual = residual - local low-frequency residual
+wavelet/frequency score = normalized high-frequency residual response
+final score = adaptive fusion + alpha * wavelet score
+```
+
+This is lower risk than adding a full diffusion or wavelet-Mamba branch immediately.
+
+### Step 4: Error-adaptive convolution
+
+The 2025 IMP/SuperAD direction describes three complementary pieces:
+
+```text
+perturbation:     superpixel pooling / uppooling
+reconstruction:   error-adaptive convolution
+regularization:   online background pixel mining
+```
+
+Current SP-IMP-DPMN already covers perturbation and regularization. The missing model-level piece is error-adaptive convolution, which can be considered after score-side improvements are validated.
+
+
+
+### Execution update: Step 1 and Step 2
+
+Date: 2026-06-11.
+
+Step 1 full adaptive-fusion rerun completed in:
+
+```text
+results_sp_imp_dpmn_adaptive_full/
+```
+
+Summary:
+
+```text
+sample_count: 15
+mean_auc: 0.939775035950
+mean_stop_iteration: 800.00
+mean_elapsed_seconds: 92.9591
+```
+
+The full rerun confirms that adaptive score fusion improves the full SP-IMP-DPMN run versus the earlier tuned mean AUC of `0.916926731476`, but the clean full-run mean is slightly lower than the two-sample replacement projection of `0.942882844048`.
+
+Step 2 localization metrics were computed from the saved `fused_score` maps without retraining. Outputs:
+
+```text
+results_sp_imp_dpmn_adaptive_full/extra_metrics_sp_imp_dpmn.csv
+results_sp_imp_dpmn_adaptive_full/extra_metrics_sp_imp_dpmn.txt
+```
+
+Metric means:
+
+```text
+Mean AUPR: 0.342769952485
+Mean precision@K: 0.339448691725
+Mean best_f1: 0.395349869969
+Mean IoU@bestF1: 0.282656780208
+```
+
+Notable observation:
+
+- `abu_urban_2` is now strong on both ranking and localization: AUC `0.993923229411`, AUPR `0.894372078765`, precision@K `0.819354838710`, IoU@bestF1 `0.712643678161`.
+- `abu_beach_2` remains weak after adaptive fusion: AUC `0.863029230051`, AUPR `0.070023386542`, precision@K `0.039603960396`, IoU@bestF1 `0.086255259467`.
+- `sample 3` has good ROC-AUC (`0.930643263091`) but poor localization metrics, especially precision@K `0.0`; this suggests score ranking is partially correct globally but not concentrated enough at the top anomaly budget.
+
+Next recommended action is still Step 3: add a wavelet or local high-frequency residual score as a score-side component first, then evaluate whether it improves the weak localization cases before modifying AGM/DPMN internals.
+
+
+### Execution update: Step 3 wavelet/high-frequency residual score
+
+Date: 2026-06-11.
+
+`PyWavelets` was installed in the active Python environment:
+
+```text
+PyWavelets 1.8.0
+```
+
+Two post-hoc score-side experiments were run from the saved adaptive-fusion score components, without retraining the DPMN backbone:
+
+```text
+results_sp_imp_dpmn_adaptive_full/wavelet_score_sweep_sp_imp_dpmn.csv
+results_sp_imp_dpmn_adaptive_full/wavelet_score_sweep_sp_imp_dpmn.txt
+results_sp_imp_dpmn_adaptive_full/pywt_score_sweep_sp_imp_dpmn.csv
+results_sp_imp_dpmn_adaptive_full/pywt_score_sweep_sp_imp_dpmn.txt
+```
+
+Baseline for comparison is the Step 1/2 adaptive fused score:
+
+```text
+AUC: 0.939775035950
+AUPR: 0.342769952485
+precision@K: 0.339448691725
+bestF1: 0.395349869969
+IoU@bestF1: 0.282656780208
+```
+
+Best true `pywt` configuration by AUPR and IoU@bestF1:
+
+```text
+wavelet: haar
+level: 1
+alpha: 0.30
+AUC: 0.953873731974
+AUPR: 0.356778272871
+precision@K: 0.348047710213
+bestF1: 0.405837900809
+IoU@bestF1: 0.288405723500
+```
+
+Best true `pywt` configuration by mean AUC:
+
+```text
+wavelet: db2
+level: 1
+alpha: 0.30
+AUC: 0.954664108077
+AUPR: 0.338967588556
+precision@K: 0.327906769853
+bestF1: 0.382920828727
+IoU@bestF1: 0.264141290779
+```
+
+A stationary Haar-like high-frequency residual response, implemented without downsampling, was also tested as a local high-frequency score. Its best AUC/AUPR configuration was stronger:
+
+```text
+alpha: 0.40
+AUC: 0.957072945009
+AUPR: 0.367149661258
+precision@K: 0.359885472771
+bestF1: 0.422030701441
+IoU@bestF1: 0.299804832583
+```
+
+Best IoU@bestF1 for the stationary Haar-like score was at alpha `0.50`:
+
+```text
+AUC: 0.956791689604
+AUPR: 0.363152774330
+precision@K: 0.357090111327
+bestF1: 0.425539362122
+IoU@bestF1: 0.301947628219
+```
+
+Conclusion for Step 3:
+
+- The high-frequency residual direction is validated: both true `pywt` and stationary Haar-like variants improve mean AUC over adaptive fusion alone.
+- The true `pywt` Haar level-1 score is the better conservative paper-style wavelet option because it improves AUPR and IoU while staying close to standard wavelet decomposition.
+- The stationary Haar-like response is currently the stronger engineering option for the benchmark because it avoids downsampling loss and gives the best overall localization metrics.
+- Before modifying AGM/DPMN internals, the next practical implementation should add a switchable score-side high-frequency residual component to `train.py`, default off, then run a full controlled comparison with alpha around `0.30-0.40`.
+
+
+### Implementation update: switchable high-frequency score in train.py
+
+Date: 2026-06-11.
+
+A switchable final-score high-frequency residual component was added to `train.py`. It does not change the DPMN/AGM network or the training loss; it only modifies the final anomaly map after the original residual/contrast/uncertainty fusion.
+
+New CLI options:
+
+```bash
+--highfreq-score-mode none|stationary_haar|pywt
+--highfreq-weight ALPHA
+--highfreq-wavelet haar
+--highfreq-level 1
+```
+
+Fusion form:
+
+```text
+final_score = normalize((1 - alpha) * adaptive_fused_score + alpha * highfreq_score)
+```
+
+Supported modes:
+
+```text
+none: default; preserves previous behavior
+stationary_haar: no-downsampling Haar-like local high-frequency residual response
+pywt: PyWavelets wavedec2/waverec2 detail-only high-frequency residual response
+```
+
+Smoke test command:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids 1 --num-iter 2 --results-dir /tmp/dpmn_highfreq_smoke --highfreq-score-mode pywt --highfreq-weight 0.3 --highfreq-wavelet haar --highfreq-level 1 --log-interval 1
+```
+
+Smoke test result:
+
+```text
+completed successfully
+score component keys: contrast_score, fused_score, highfreq_score, residual_score, uncertainty_score, weights
+highfreq_score shape: (80, 100)
+fused_score shape: (80, 100)
+```
+
+Recommended full controlled runs:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_pywt_hf_a03 --highfreq-score-mode pywt --highfreq-weight 0.3 --highfreq-wavelet haar --highfreq-level 1
+python -u train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_stationary_hf_a04 --highfreq-score-mode stationary_haar --highfreq-weight 0.4
+```
+
+The first command is the conservative wavelet-paper variant. The second command is the stronger benchmark-oriented high-frequency residual variant from the post-hoc sweep.
+
+
+### Conversation update: resume and run decision
+
+Date: 2026-06-11.
+
+The interrupted adaptive-fusion run was checked and did not need to be resumed. The process had already completed all 15 samples in `results_sp_imp_dpmn_adaptive_full`, with full-run mean AUC:
+
+```text
+0.939775035950
+```
+
+The follow-up discussion established the next practical step:
+
+1. Keep the completed adaptive-fusion full run as the baseline.
+2. Use the saved score components to compute localization metrics and high-frequency residual score sweeps.
+3. Install `PyWavelets` when `pywt` was missing instead of staying with an approximation only.
+4. Implement high-frequency residual score as a switchable final-score component in `train.py`, default off.
+5. Run a controlled full experiment to see whether the post-hoc gain survives an end-to-end run.
+
+Implemented and verified so far:
+
+```text
+PyWavelets installed: 1.8.0
+train.py syntax check: passed
+smoke test: passed
+smoke output includes highfreq_score with the same shape as fused_score
+```
+
+Best post-hoc candidates:
+
+```text
+Conservative pywt option:
+  --highfreq-score-mode pywt --highfreq-weight 0.3 --highfreq-wavelet haar --highfreq-level 1
+  post-hoc mean AUC: 0.953873731974
+  post-hoc mean AUPR: 0.356778272871
+  post-hoc mean IoU@bestF1: 0.288405723500
+
+Stronger stationary option:
+  --highfreq-score-mode stationary_haar --highfreq-weight 0.4
+  post-hoc mean AUC: 0.957072945009
+  post-hoc mean AUPR: 0.367149661258
+  post-hoc mean IoU@bestF1: 0.299804832583
+```
+
+Next run selected from the conversation:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_stationary_hf_a04 --highfreq-score-mode stationary_haar --highfreq-weight 0.4
+```
+
+Reason: the stationary Haar-like high-frequency residual score was the strongest post-hoc benchmark candidate and does not modify AGM/DPMN internals.
+
+
+### Execution update: full stationary Haar high-frequency run
+
+Date: 2026-06-11.
+
+The selected full run completed successfully:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_stationary_hf_a04 --highfreq-score-mode stationary_haar --highfreq-weight 0.4
+```
+
+Output directory:
+
+```text
+results_sp_imp_dpmn_stationary_hf_a04/
+```
+
+Full-run AUC summary:
+
+```text
+sample_count: 15
+mean_auc: 0.956469872526
+mean_stop_iteration: 800.00
+mean_elapsed_seconds: 94.3856
+```
+
+Compared with the adaptive-fusion full run:
+
+```text
+adaptive full mean AUC:        0.939775035950
+stationary_hf_a04 mean AUC:    0.956469872526
+absolute gain:                 +0.016694836576
+```
+
+Localization metrics for the full stationary high-frequency run:
+
+```text
+Mean AUPR: 0.361500144012
+Mean precision@K: 0.360311045273
+Mean best_f1: 0.418435819511
+Mean IoU@bestF1: 0.293532509189
+```
+
+Compared with the adaptive-fusion full run localization metrics:
+
+```text
+AUPR:        0.342769952485 -> 0.361500144012  (+0.018730191527)
+precision@K: 0.339448691725 -> 0.360311045273  (+0.020862353548)
+bestF1:      0.395349869969 -> 0.418435819511  (+0.023085949542)
+IoU@bestF1:  0.282656780208 -> 0.293532509189  (+0.010875728981)
+```
+
+Per-sample AUC highlights:
+
+```text
+sample 1:       0.939752564768 -> 0.931242129638  (-0.008510435130)
+sample 3:       0.930643263091 -> 0.913454056543  (-0.017189206548)
+abu_airport_1: 0.883787653319 -> 0.925198553617  (+0.041410900298)
+abu_airport_2: 0.881610238964 -> 0.927165187708  (+0.045554948744)
+abu_airport_3: 0.912880737239 -> 0.946461612112  (+0.033580874873)
+abu_airport_4: 0.955591884641 -> 0.973816230718  (+0.018224346077)
+abu_beach_1:   0.943395475478 -> 0.984297851519  (+0.040902376041)
+abu_beach_2:   0.863029230051 -> 0.836264574100  (-0.026764655951)
+abu_beach_3:   0.930887612738 -> 0.992191410552  (+0.061303797814)
+abu_beach_4:   0.953513756608 -> 0.987403105857  (+0.033889349249)
+abu_urban_1:   0.987175268328 -> 0.986993453151  (-0.000181815177)
+abu_urban_2:   0.993923229411 -> 0.991716115926  (-0.002207113485)
+abu_urban_3:   0.966328755683 -> 0.984072948563  (+0.017744192880)
+abu_urban_4:   0.988203397107 -> 0.993360584365  (+0.005157187258)
+abu_urban_5:   0.965902471829 -> 0.973410273518  (+0.007507801689)
+```
+
+Interpretation:
+
+- The stationary high-frequency residual score is validated in the actual `train.py` full run, not only post-hoc: mean AUC and all localization-oriented mean metrics improved.
+- The largest gains are on airport and most beach samples, especially `abu_beach_3`, `abu_beach_1`, `abu_airport_1`, and `abu_airport_2`.
+- `abu_beach_2` remains the main failure case and gets worse under this global alpha. This suggests the next refinement should make the high-frequency alpha adaptive or sample/region-gated rather than fixed at `0.4` everywhere.
+- `sample 3` still has poor localization and lower AUC in this run; its scale and loss behavior remain different from the normalized ABU samples, so it may need normalization-specific handling or separate reporting.
+
+Recommended next controlled experiment:
+
+```text
+Run alpha sweep through train.py, not only post-hoc, on the known sensitive samples first:
+  sample_ids: 3, abu_beach_2, abu_airport_1, abu_airport_2, abu_beach_3
+  alpha: 0.1, 0.2, 0.3, 0.4
+Then decide whether to use fixed alpha=0.3/0.4 or adaptive gating.
+```
+
+
+### Conversation update: next step after stationary high-frequency full run
+
+Date: 2026-06-11.
+
+After the full `stationary_haar` alpha `0.4` run, the conclusion was added to the working plan:
+
+```text
+Do not move directly into AGM/DPMN backbone changes yet.
+First run a small alpha sweep or adaptive gating experiment to avoid harming sensitive samples such as abu_beach_2 and sample 3.
+```
+
+Reason:
+
+- The full run improved the global mean AUC and all mean localization metrics.
+- The fixed global alpha `0.4` still hurt `abu_beach_2` and `sample 3`.
+- This indicates the high-frequency residual branch is useful, but its contribution should probably be sample-aware or region-aware.
+- Backbone changes such as error-adaptive convolution should wait until the score-side behavior is better characterized.
+
+Immediate next experiment:
+
+```text
+Targeted train.py alpha sweep, not post-hoc only.
+Samples: 3, abu_beach_2, abu_airport_1, abu_airport_2, abu_beach_3
+Alpha values: 0.1, 0.2, 0.3, 0.4
+Mode: stationary_haar
+```
+
+Target commands follow this pattern:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids 3,abu_beach_2,abu_airport_1,abu_airport_2,abu_beach_3 --results-dir results_sp_imp_dpmn_stationary_hf_aXX_targeted --highfreq-score-mode stationary_haar --highfreq-weight X.X
+```
+
+Decision criterion:
+
+- If one lower fixed alpha preserves airport/beach_3 gains while reducing damage on `abu_beach_2` and `sample 3`, use that alpha for the next full run.
+- If no fixed alpha works, implement adaptive gating for the high-frequency score before touching AGM/DPMN internals.
+
+
+### Execution update: targeted stationary Haar alpha sweep
+
+Date: 2026-06-12.
+
+The targeted `train.py` alpha sweep completed after the interruption was resumed. This was a real rerun, not a post-hoc sweep.
+
+Samples:
+
+```text
+3, abu_airport_1, abu_airport_2, abu_beach_2, abu_beach_3
+```
+
+Alpha values:
+
+```text
+0.1, 0.2, 0.3, 0.4
+```
+
+Output directories:
+
+```text
+results_sp_imp_dpmn_stationary_hf_a01_targeted/
+results_sp_imp_dpmn_stationary_hf_a02_targeted/
+results_sp_imp_dpmn_stationary_hf_a03_targeted/
+results_sp_imp_dpmn_stationary_hf_a04_targeted/
+results_sp_imp_dpmn_stationary_hf_alpha_sweep_targeted/alpha_sweep_auc_summary.csv
+```
+
+AUC summary:
+
+```text
+alpha,mean_auc,3,abu_airport_1,abu_airport_2,abu_beach_2,abu_beach_3
+0.1,0.917038142731,0.930618560885,0.924123348440,0.900642486182,0.838288375684,0.991517942464
+0.2,0.920520485638,0.926406834748,0.933419011544,0.918681030714,0.836745830125,0.987349721057
+0.3,0.922560467721,0.923124970225,0.920749064304,0.926238736780,0.850825789866,0.991863777428
+0.4,0.920602443326,0.914648584652,0.936561485390,0.928001196617,0.833593540003,0.990207409969
+```
+
+Interpretation:
+
+- Best targeted mean AUC is alpha `0.3`: `0.922560467721`.
+- `sample 3` prefers low alpha; alpha `0.1` gives `0.930618560885`, while alpha `0.4` drops to `0.914648584652`.
+- `abu_airport_2` prefers higher alpha; alpha `0.4` gives `0.928001196617`.
+- `abu_airport_1` is strongest at alpha `0.4` in this targeted run: `0.936561485390`.
+- `abu_beach_3` is strong across all alpha values, with alpha `0.3` slightly best: `0.991863777428`.
+- `abu_beach_2` remains weak for all fixed alpha values. Its best targeted alpha is `0.3` with AUC `0.850825789866`, still below the adaptive-fusion full-run value `0.863029230051`.
+
+Conclusion:
+
+A single fixed high-frequency alpha is not enough. The score-side high-frequency branch is useful, but the contribution should be gated. The next implementation should add adaptive high-frequency gating before any AGM/DPMN backbone modification.
+
+Recommended gating direction:
+
+```text
+base_score = adaptive residual/contrast/uncertainty fusion
+hf_score = stationary Haar high-frequency residual score
+hf_agreement = rank/top-k agreement between base_score and hf_score
+alpha_eff = low alpha when hf disagrees with base_score, higher alpha when hf agrees
+final_score = normalize((1 - alpha_eff) * base_score + alpha_eff * hf_score)
+```
+
+A conservative first implementation can use a sample-level gate:
+
+```text
+if top-k overlap(base_score, hf_score) is low or rank correlation is low:
+    alpha_eff = 0.1
+else:
+    alpha_eff = 0.3 or 0.4
+```
+
+This is lower risk than changing AGM/DPMN internals and directly targets the observed failure mode: `sample 3` and `abu_beach_2` are damaged when the high-frequency score is over-weighted globally.
+
+
+### Conversation update: resumed interruption, GitHub sync, and next gating step
+
+Date: 2026-06-12.
+
+The previous turn was interrupted accidentally after the targeted alpha sweep had already completed. On resume, the run state was checked:
+
+```text
+No train.py process remained running.
+All four targeted alpha sweep CSV files were present.
+```
+
+The alpha sweep summary was regenerated and saved to:
+
+```text
+results_sp_imp_dpmn_stationary_hf_alpha_sweep_targeted/alpha_sweep_auc_summary.csv
+```
+
+Final targeted alpha sweep conclusion:
+
+```text
+A single fixed high-frequency alpha is not enough.
+sample 3 prefers low alpha.
+airport samples prefer higher alpha.
+abu_beach_2 remains below the adaptive-fusion baseline under all fixed alpha values.
+```
+
+The current working decision is:
+
+```text
+Do not move into AGM/DPMN backbone changes yet.
+Commit and push the current score-side high-frequency work to GitHub.
+Then implement adaptive high-frequency gating as the next score-side step.
+```
+
+Planned adaptive gating implementation:
+
+```text
+base_score = adaptive residual/contrast/uncertainty fusion
+hf_score = stationary Haar high-frequency residual score
+agreement = top-k overlap and rank correlation between base_score and hf_score
+alpha_eff = low alpha when agreement is weak, high alpha when agreement is strong
+final_score = normalize((1 - alpha_eff) * base_score + alpha_eff * hf_score)
+```
+
+Initial conservative gate:
+
+```text
+low_alpha = 0.1
+high_alpha = 0.4
+if top-k overlap >= threshold and rank correlation >= threshold:
+    alpha_eff = high_alpha
+else:
+    alpha_eff = low_alpha
+```
+
+This directly targets the observed conflict: `sample 3` and `abu_beach_2` are harmed by over-weighting high-frequency residual globally, while airport samples benefit from stronger high-frequency contribution.

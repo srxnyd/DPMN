@@ -83,16 +83,16 @@ def ensure_dir(path):
 def save_score_components(output_dir, sample_id, score_maps, weights):
     ensure_dir(output_dir)
     mat_path = os.path.join(output_dir, f"urban_scores_{sample_id}.mat")
-    scipy.io.savemat(
-        mat_path,
-        {
-            "residual_score": np.asarray(score_maps["residual_score"], dtype=np.float32),
-            "contrast_score": np.asarray(score_maps["contrast_score"], dtype=np.float32),
-            "uncertainty_score": np.asarray(score_maps["uncertainty_score"], dtype=np.float32),
-            "fused_score": np.asarray(score_maps["fused_score"], dtype=np.float32),
-            "weights": np.asarray(weights, dtype=np.float32),
-        },
-    )
+    save_data = {
+        "residual_score": np.asarray(score_maps["residual_score"], dtype=np.float32),
+        "contrast_score": np.asarray(score_maps["contrast_score"], dtype=np.float32),
+        "uncertainty_score": np.asarray(score_maps["uncertainty_score"], dtype=np.float32),
+        "fused_score": np.asarray(score_maps["fused_score"], dtype=np.float32),
+        "weights": np.asarray(weights, dtype=np.float32),
+    }
+    if "highfreq_score" in score_maps and score_maps["highfreq_score"] is not None:
+        save_data["highfreq_score"] = np.asarray(score_maps["highfreq_score"], dtype=np.float32)
+    scipy.io.savemat(mat_path, save_data)
     return mat_path
 
 
@@ -837,6 +837,58 @@ def should_use_uncertainty_score(residual_score, contrast_score, uncertainty_sco
     return bool((top_overlap > 0.20 and residual_corr > 0.15 and contrast_corr > 0.05).item())
 
 
+def compute_stationary_haar_highfreq_score(residual_score, eps=1e-8):
+    kernels = torch.tensor(
+        [
+            [[1.0, 1.0], [-1.0, -1.0]],
+            [[1.0, -1.0], [1.0, -1.0]],
+            [[1.0, -1.0], [-1.0, 1.0]],
+        ],
+        device=residual_score.device,
+        dtype=residual_score.dtype,
+    ).view(3, 1, 2, 2) * 0.5
+    padded = F.pad(residual_score, (0, 1, 0, 1), mode="replicate")
+    detail = F.conv2d(padded, kernels)
+    highfreq_score = torch.sqrt((detail * detail).sum(dim=1, keepdim=True).clamp_min(eps))
+    return min_max_normalize(highfreq_score, eps=eps)
+
+
+def compute_pywt_highfreq_score(residual_score, wavelet="haar", level=1, eps=1e-8):
+    try:
+        import pywt
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("PyWavelets is required for --highfreq-score-mode pywt. Install PyWavelets first.") from exc
+
+    residual_np = residual_score.detach().cpu().squeeze().numpy()
+    max_level = pywt.dwtn_max_level(residual_np.shape, wavelet)
+    effective_level = max(1, min(int(level), int(max_level)))
+    coeffs = pywt.wavedec2(residual_np, wavelet=wavelet, level=effective_level, mode="periodization")
+    detail_coeffs = [np.zeros_like(coeffs[0])]
+    for detail in coeffs[1:]:
+        detail_coeffs.append(tuple(np.asarray(item) for item in detail))
+    reconstructed = pywt.waverec2(detail_coeffs, wavelet=wavelet, mode="periodization")
+    reconstructed = np.abs(reconstructed[: residual_np.shape[0], : residual_np.shape[1]])
+    highfreq_score = torch.from_numpy(reconstructed).to(device=residual_score.device, dtype=residual_score.dtype)
+    return min_max_normalize(highfreq_score.view_as(residual_score), eps=eps)
+
+
+def compute_highfreq_score(residual_score, mode="none", wavelet="haar", level=1):
+    if mode == "none":
+        return None
+    if mode == "stationary_haar":
+        return compute_stationary_haar_highfreq_score(residual_score)
+    if mode == "pywt":
+        return compute_pywt_highfreq_score(residual_score, wavelet=wavelet, level=level)
+    raise ValueError(f"Unknown high-frequency score mode: {mode}")
+
+
+def fuse_with_highfreq_score(base_score, highfreq_score, highfreq_weight):
+    if highfreq_score is None or highfreq_weight <= 0.0:
+        return base_score
+    alpha = min(1.0, max(0.0, float(highfreq_weight)))
+    return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score)
+
+
 def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights, adaptive=False):
     if adaptive and not should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
         fused_score = 0.85 * residual_score + 0.15 * contrast_score
@@ -892,7 +944,19 @@ def compute_mask_guided_joint_loss(
     return total_loss, metrics
 
 
-def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_kernel, weights, adaptive_score_fusion=False):
+def compute_final_artifacts(
+    net,
+    net_input_saved,
+    mask_var,
+    img_var,
+    spatial_kernel,
+    weights,
+    adaptive_score_fusion=False,
+    highfreq_score_mode="none",
+    highfreq_weight=0.0,
+    highfreq_wavelet="haar",
+    highfreq_level=1,
+):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
         out, out_h = net(net_input_saved, enhancement_prior=enhancement_prior)
@@ -900,6 +964,12 @@ def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_ker
         residual_score = min_max_normalize(residual_score)
         contrast_score = compute_spectral_contrast_score(img_var, kernel_size=spatial_kernel)
         uncertainty_score = compute_abundance_uncertainty_score(out)
+        highfreq_score = compute_highfreq_score(
+            residual_score,
+            mode=highfreq_score_mode,
+            wavelet=highfreq_wavelet,
+            level=highfreq_level,
+        )
         fused_score = fuse_detection_scores(
             residual_score,
             contrast_score,
@@ -907,12 +977,15 @@ def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_ker
             weights=weights,
             adaptive=adaptive_score_fusion,
         )
+        fused_score = fuse_with_highfreq_score(fused_score, highfreq_score, highfreq_weight)
 
+    highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
     return {
         "background_img": out_h.detach().cpu().squeeze(0).numpy(),
         "residual_score": residual_score.detach().cpu().squeeze().numpy(),
         "contrast_score": contrast_score.detach().cpu().squeeze().numpy(),
         "uncertainty_score": uncertainty_score.detach().cpu().squeeze().numpy(),
+        "highfreq_score": highfreq_score_np,
         "fused_score": fused_score.detach().cpu().squeeze().numpy(),
         "mask": mask_var.detach().cpu().squeeze().numpy(),
     }
@@ -1023,6 +1096,10 @@ def run_single_sample(
     superpixel_compactness = float(mode_config.get("superpixel_compactness", 0.08))
     sp_target_weight = float(mode_config.get("sp_target_weight", 1.0))
     adaptive_score_fusion = bool(mode_config.get("adaptive_score_fusion", False))
+    highfreq_score_mode = mode_config.get("highfreq_score_mode", "none")
+    highfreq_weight = float(mode_config.get("highfreq_weight", 0.0))
+    highfreq_wavelet = mode_config.get("highfreq_wavelet", "haar")
+    highfreq_level = int(mode_config.get("highfreq_level", 1))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1221,6 +1298,10 @@ def run_single_sample(
                 spatial_kernel,
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
                 adaptive_score_fusion=adaptive_score_fusion,
+                highfreq_score_mode=highfreq_score_mode,
+                highfreq_weight=highfreq_weight,
+                highfreq_wavelet=highfreq_wavelet,
+                highfreq_level=highfreq_level,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1238,6 +1319,7 @@ def run_single_sample(
                     "residual_score": final_artifacts["residual_score"],
                     "contrast_score": final_artifacts["contrast_score"],
                     "uncertainty_score": final_artifacts["uncertainty_score"],
+                    "highfreq_score": final_artifacts["highfreq_score"],
                     "fused_score": final_artifacts["fused_score"],
                 },
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
@@ -1327,6 +1409,29 @@ def parse_args():
         type=float,
         default=None,
         help="Weight of abundance uncertainty in the fused anomaly map.",
+    )
+    parser.add_argument(
+        "--highfreq-score-mode",
+        choices=["none", "stationary_haar", "pywt"],
+        default="none",
+        help="Optional high-frequency residual score fused only into the final anomaly map.",
+    )
+    parser.add_argument(
+        "--highfreq-weight",
+        type=float,
+        default=0.0,
+        help="Alpha for final fusion: (1-alpha) * fused_score + alpha * highfreq_score.",
+    )
+    parser.add_argument(
+        "--highfreq-wavelet",
+        default="haar",
+        help="PyWavelets wavelet name used when --highfreq-score-mode pywt is selected.",
+    )
+    parser.add_argument(
+        "--highfreq-level",
+        type=int,
+        default=1,
+        help="PyWavelets decomposition level used when --highfreq-score-mode pywt is selected.",
     )
     parser.add_argument(
         "--log-interval",
@@ -1525,6 +1630,10 @@ def main():
     mode_config["residual_weight"] = residual_weight / weight_sum
     mode_config["contrast_weight"] = contrast_weight / weight_sum
     mode_config["uncertainty_weight"] = uncertainty_weight / weight_sum
+    mode_config["highfreq_score_mode"] = args.highfreq_score_mode
+    mode_config["highfreq_weight"] = min(1.0, max(0.0, float(args.highfreq_weight)))
+    mode_config["highfreq_wavelet"] = args.highfreq_wavelet
+    mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)
     ensure_dir(visualization_dir)
 
