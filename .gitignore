@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+conda_env/
+
+# Logs
+*.log
+logs/
+
+# Data
+data/
+dataset/
+datasets/
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Result folders
+.result*/
+.results*/
+result*/
+results*/
+oldresult*/
+ppt_visuals*/
+ppt_visuals_old_vs_new_no_leak/
+
+# Figures / generated files
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.csv
+*.txt
+
+# Models / checkpoints
+checkpoints/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.gguf
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
