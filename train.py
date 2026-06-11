@@ -41,6 +41,19 @@ ABLATION_MODES = {
     "sam_only": {"adaptive_mask": False, "sam_loss": True},
     "mask_sam": {"adaptive_mask": True, "sam_loss": True},
     "prior_blindspot": {"adaptive_mask": True, "sam_loss": False, "prior_mode": "consensus", "blindspot": True},
+    "sp_imp_dpmn": {
+        "adaptive_mask": True,
+        "sam_loss": True,
+        "prior_mode": "sp_imp",
+        "superpixel_perturb": True,
+        "online_background_mining": True,
+        "blindspot": False,
+        "num_iter": 800,
+        "sp_target_weight": 0.6,
+        "residual_weight": 0.8,
+        "contrast_weight": 0.15,
+        "uncertainty_weight": 0.05,
+    },
     "full_innovation": {
         "adaptive_mask": True,
         "sam_loss": True,
@@ -300,6 +313,73 @@ def normalize_endmember_columns(array, eps=1e-8):
     return array / norms
 
 
+def make_grid_superpixel_labels(height, width, desired_segments):
+    desired_segments = max(1, int(desired_segments))
+    aspect = float(width) / float(max(height, 1))
+    grid_rows = max(1, int(round(np.sqrt(desired_segments / max(aspect, 1e-6)))))
+    grid_cols = max(1, int(np.ceil(float(desired_segments) / float(grid_rows))))
+    y_bins = np.linspace(0, height, grid_rows + 1, dtype=np.int32)
+    x_bins = np.linspace(0, width, grid_cols + 1, dtype=np.int32)
+    labels = np.zeros((height, width), dtype=np.int32)
+    label_id = 0
+    for y_idx in range(grid_rows):
+        for x_idx in range(grid_cols):
+            labels[y_bins[y_idx]:y_bins[y_idx + 1], x_bins[x_idx]:x_bins[x_idx + 1]] = label_id
+            label_id += 1
+    return labels
+
+
+def compute_superpixel_labels(image_np, desired_segments=256, compactness=0.08):
+    _, height, width = image_np.shape
+    try:
+        from skimage.segmentation import slic
+
+        display_img = build_display_image_from_hsi(image_np)
+        labels = slic(
+            display_img,
+            n_segments=max(2, int(desired_segments)),
+            compactness=float(compactness),
+            sigma=1.0,
+            start_label=0,
+            channel_axis=-1,
+        )
+        return np.asarray(labels, dtype=np.int32)
+    except Exception as exc:
+        print(f"Superpixel SLIC unavailable ({exc}); using grid pooling fallback.")
+        return make_grid_superpixel_labels(height, width, desired_segments)
+
+
+def pool_hsi_by_superpixel(image_np, labels):
+    image_np = np.asarray(image_np, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int32)
+    bands, height, width = image_np.shape
+    flat_labels = labels.reshape(-1)
+    label_count = int(flat_labels.max()) + 1
+    pooled = np.zeros((bands, height * width), dtype=np.float32)
+    counts = np.bincount(flat_labels, minlength=label_count).astype(np.float32)
+    counts = np.maximum(counts, 1.0)
+    for band_idx in range(bands):
+        band_flat = image_np[band_idx].reshape(-1)
+        sums = np.bincount(flat_labels, weights=band_flat, minlength=label_count).astype(np.float32)
+        means = sums / counts
+        pooled[band_idx] = means[flat_labels]
+    return pooled.reshape(bands, height, width)
+
+
+def smooth_mask_by_superpixel(mask_tensor, labels_tensor, eps=1e-8):
+    if labels_tensor is None:
+        return mask_tensor
+    labels = labels_tensor.view(-1)
+    mask_flat = mask_tensor.squeeze(0).squeeze(0).reshape(-1)
+    label_count = int(labels.max().item()) + 1
+    sums = torch.zeros(label_count, device=mask_tensor.device, dtype=mask_tensor.dtype)
+    counts = torch.zeros(label_count, device=mask_tensor.device, dtype=mask_tensor.dtype)
+    sums.scatter_add_(0, labels, mask_flat)
+    counts.scatter_add_(0, labels, torch.ones_like(mask_flat))
+    means = sums / counts.clamp_min(eps)
+    return means[labels].view_as(mask_tensor).clamp(0.02, 1.0)
+
+
 def print_sample_stats(sample_id, img_np, e_np, label_np, stage):
     print(
         f"sample {sample_id} [{stage}] image stats: "
@@ -342,6 +422,51 @@ def compute_adaptive_mask(recon_img, target_img, warmup_progress, spatial_kernel
     refined_mask = (0.6 * soft_mask + 0.4 * hard_mask).clamp(0.05, 1.0)
     residual_map = min_max_normalize(spectral_error.squeeze(0).squeeze(0), eps=eps)
     return refined_mask, residual_map
+
+
+def compute_online_background_mining_mask(
+    recon_img,
+    target_img,
+    abundance_map,
+    warmup_progress,
+    spatial_kernel=7,
+    superpixel_labels=None,
+    eps=1e-8,
+):
+    residual_score = (recon_img - target_img).pow(2).sum(dim=1, keepdim=True)
+    residual_score = min_max_normalize(residual_score, eps=eps)
+    spatial_score = F.avg_pool2d(
+        residual_score,
+        kernel_size=spatial_kernel,
+        stride=1,
+        padding=spatial_kernel // 2,
+    )
+    spatial_score = min_max_normalize(spatial_score, eps=eps)
+    contrast_score = compute_spectral_contrast_score(target_img, kernel_size=spatial_kernel, eps=eps)
+    uncertainty_score = compute_abundance_uncertainty_score(abundance_map, eps=eps)
+
+    anomaly_score = (
+        0.45 * rank_normalize_score(residual_score, eps=eps)
+        + 0.25 * rank_normalize_score(spatial_score, eps=eps)
+        + 0.20 * rank_normalize_score(contrast_score, eps=eps)
+        + 0.10 * rank_normalize_score(uncertainty_score, eps=eps)
+    )
+    anomaly_score = F.avg_pool2d(
+        anomaly_score,
+        kernel_size=spatial_kernel,
+        stride=1,
+        padding=spatial_kernel // 2,
+    )
+    anomaly_score = min_max_normalize(anomaly_score, eps=eps)
+
+    background_confidence = (1.0 - anomaly_score).clamp(0.02, 1.0)
+    background_confidence = smooth_mask_by_superpixel(background_confidence, superpixel_labels, eps=eps)
+    quantile = 0.45 + 0.25 * warmup_progress
+    threshold = torch.quantile(background_confidence.flatten(), quantile)
+    hard_background = (background_confidence >= threshold).float()
+    hard_weight = 0.35 + 0.35 * warmup_progress
+    refined_mask = ((1.0 - hard_weight) * background_confidence + hard_weight * hard_background).clamp(0.02, 1.0)
+    return refined_mask, anomaly_score.squeeze(0).squeeze(0)
 
 
 
@@ -815,6 +940,7 @@ def run_single_sample(
     artifact_root_dir,
     log_interval,
     normalize_inputs,
+    num_iter_override=None,
 ):
     start_time = time.time()
     torch.cuda.empty_cache()
@@ -832,7 +958,7 @@ def run_single_sample(
     opt_over = "net"
     method = "2D"
     lr = 0.001
-    num_iter = 1500
+    num_iter = int(num_iter_override) if num_iter_override is not None else int(mode_config.get("num_iter", 1500))
     param_noise = False
     reg_noise_std = 0
     lam = 0.001
@@ -855,6 +981,11 @@ def run_single_sample(
     low_rank_weight = float(mode_config.get("low_rank_weight", 0.0))
     sparse_weight = float(mode_config.get("sparse_weight", 0.0))
     low_rank_fraction = float(mode_config.get("low_rank_fraction", 0.15))
+    use_superpixel_perturb = bool(mode_config.get("superpixel_perturb", False))
+    use_online_background_mining = bool(mode_config.get("online_background_mining", False))
+    superpixel_segments = int(mode_config.get("superpixel_segments", 256))
+    superpixel_compactness = float(mode_config.get("superpixel_compactness", 0.08))
+    sp_target_weight = float(mode_config.get("sp_target_weight", 1.0))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -873,7 +1004,23 @@ def run_single_sample(
         print_sample_stats(sample_id, img_np, e_np, label_np, stage="normalized")
 
     e_torch = torch.from_numpy(e_np).type(dtype)
+    sp_labels_np = None
+    train_target_np = img_np
+    if use_superpixel_perturb:
+        sp_labels_np = compute_superpixel_labels(
+            img_np,
+            desired_segments=superpixel_segments,
+            compactness=superpixel_compactness,
+        )
+        sp_pooled_np = pool_hsi_by_superpixel(img_np, sp_labels_np)
+        train_target_np = sp_target_weight * sp_pooled_np + (1.0 - sp_target_weight) * img_np
+        print(
+            f"sample {sample_id} [sp_imp] superpixels={int(sp_labels_np.max()) + 1}, "
+            f"target_delta_mean={np.abs(train_target_np - img_np).mean():.6f}"
+        )
+
     img_var = torch.from_numpy(img_np).type(dtype)
+    train_target_var = torch.from_numpy(train_target_np).type(dtype)
 
     img_size = img_var.size()
     e_size = e_torch.size()
@@ -889,7 +1036,11 @@ def run_single_sample(
     net.cuda()
 
     img_var = img_var[None, :].cuda()
+    train_target_var = train_target_var[None, :].cuda()
     e_torch = e_torch.cuda()
+    sp_labels_var = None
+    if sp_labels_np is not None:
+        sp_labels_var = torch.from_numpy(sp_labels_np.astype(np.int64)).cuda()
 
     mask_var = torch.ones(1, 1, row, col).cuda()
     residual_varr = torch.ones(row, col).cuda()
@@ -928,7 +1079,16 @@ def run_single_sample(
 
         if use_adaptive_mask and iter_num % mask_update_interval == 0 and iter_num != 0:
             warmup_progress = min(1.0, float(iter_num) / float(warmup_iters))
-            if prior_mode == "consensus":
+            if use_online_background_mining or prior_mode == "sp_imp":
+                refined_mask, residual_img = compute_online_background_mining_mask(
+                    recon_img=out_h.detach(),
+                    target_img=img_var.detach(),
+                    abundance_map=out.detach(),
+                    warmup_progress=warmup_progress,
+                    spatial_kernel=spatial_kernel,
+                    superpixel_labels=sp_labels_var,
+                )
+            elif prior_mode == "consensus":
                 refined_mask, residual_img = compute_consensus_anomaly_prior(
                     recon_img=out_h.detach(),
                     target_img=img_var.detach(),
@@ -955,7 +1115,7 @@ def run_single_sample(
         total_loss, metrics = compute_mask_guided_joint_loss(
             out=out,
             out_h=out_h,
-            target_img=img_var,
+            target_img=train_target_var,
             mask=mask_var_clone,
             lam=lam,
             sam_weight=current_sam_weight,
@@ -1114,19 +1274,19 @@ def parse_args():
     parser.add_argument(
         "--residual-weight",
         type=float,
-        default=0.6,
+        default=None,
         help="Weight of reconstruction residual in the fused anomaly map.",
     )
     parser.add_argument(
         "--contrast-weight",
         type=float,
-        default=0.25,
+        default=None,
         help="Weight of local spectral contrast in the fused anomaly map.",
     )
     parser.add_argument(
         "--uncertainty-weight",
         type=float,
-        default=0.15,
+        default=None,
         help="Weight of abundance uncertainty in the fused anomaly map.",
     )
     parser.add_argument(
@@ -1142,7 +1302,7 @@ def parse_args():
     )
     parser.add_argument(
         "--prior-mode",
-        choices=["adaptive", "consensus"],
+        choices=["adaptive", "consensus", "sp_imp"],
         default=None,
         help="Mask prior strategy. Leave unset to use the selected ablation mode default.",
     )
@@ -1185,6 +1345,36 @@ def parse_args():
         type=float,
         default=0.15,
         help="Fraction of singular values retained before penalizing the low-rank tail.",
+    )
+    parser.add_argument(
+        "--superpixel-segments",
+        type=int,
+        default=256,
+        help="Approximate number of superpixels for sp_imp_dpmn.",
+    )
+    parser.add_argument(
+        "--superpixel-compactness",
+        type=float,
+        default=0.08,
+        help="SLIC compactness used by sp_imp_dpmn when scikit-image is available.",
+    )
+    parser.add_argument(
+        "--sp-target-weight",
+        type=float,
+        default=None,
+        help="Blend weight for the superpixel pooled target in sp_imp_dpmn.",
+    )
+    parser.add_argument(
+        "--num-iter",
+        type=int,
+        default=None,
+        help="Override per-sample optimization iterations; useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Limit the number of dataset files processed; useful for smoke tests.",
     )
     parser.add_argument(
         "--dataset-dir",
@@ -1245,6 +1435,8 @@ def main():
     ensure_dir(dataset_dir)
     maybe_prepare_imported_dataset(args, dataset_dir)
     dataset_files = collect_dataset_files(dataset_dir, prefix=args.dataset_prefix)
+    if args.max_samples is not None:
+        dataset_files = dataset_files[: max(0, int(args.max_samples))]
     mode_name = args.ablation_mode
     mode_config = dict(ABLATION_MODES[mode_name])
     mode_config["sam_weight"] = args.sam_weight
@@ -1263,12 +1455,22 @@ def main():
     mode_config["low_rank_weight"] = args.low_rank_weight if args.low_rank_weight > 0.0 else default_low_rank_weight
     mode_config["sparse_weight"] = args.sparse_weight if args.sparse_weight > 0.0 else default_sparse_weight
     mode_config["low_rank_fraction"] = args.low_rank_fraction
-    weight_sum = args.residual_weight + args.contrast_weight + args.uncertainty_weight
+    mode_config["superpixel_segments"] = args.superpixel_segments
+    mode_config["superpixel_compactness"] = args.superpixel_compactness
+    mode_config["sp_target_weight"] = min(
+        1.0,
+        max(0.0, args.sp_target_weight if args.sp_target_weight is not None else mode_config.get("sp_target_weight", 1.0)),
+    )
+    mode_config["num_iter"] = int(args.num_iter) if args.num_iter is not None else int(mode_config.get("num_iter", 1500))
+    residual_weight = args.residual_weight if args.residual_weight is not None else mode_config.get("residual_weight", 0.6)
+    contrast_weight = args.contrast_weight if args.contrast_weight is not None else mode_config.get("contrast_weight", 0.25)
+    uncertainty_weight = args.uncertainty_weight if args.uncertainty_weight is not None else mode_config.get("uncertainty_weight", 0.15)
+    weight_sum = residual_weight + contrast_weight + uncertainty_weight
     if weight_sum <= 0:
         raise ValueError("Fusion weights must sum to a positive value.")
-    mode_config["residual_weight"] = args.residual_weight / weight_sum
-    mode_config["contrast_weight"] = args.contrast_weight / weight_sum
-    mode_config["uncertainty_weight"] = args.uncertainty_weight / weight_sum
+    mode_config["residual_weight"] = residual_weight / weight_sum
+    mode_config["contrast_weight"] = contrast_weight / weight_sum
+    mode_config["uncertainty_weight"] = uncertainty_weight / weight_sum
     ensure_dir(batch_output_dir)
     ensure_dir(visualization_dir)
 
@@ -1288,6 +1490,7 @@ def main():
                 batch_output_dir,
                 args.log_interval,
                 args.normalize_inputs,
+                num_iter_override=args.num_iter,
             )
         )
 

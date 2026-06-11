@@ -327,3 +327,110 @@ SP-IMP-DPMN
 ```
 
 This direction is better aligned with recent 2025 work and with the actual failure observed in the current experiment.
+
+## 8. Implementation History: SP-IMP-DPMN Run
+
+Date: 2026-06-11.
+
+The first-priority direction was implemented as `sp_imp_dpmn` in `train.py`.
+
+Main code changes:
+
+- added `sp_imp_dpmn` as a new ablation mode,
+- installed and used `scikit-image` SLIC superpixels when available,
+- kept a grid-superpixel fallback for environments without `skimage`,
+- pooled HSI pixels by superpixel to create a region-level reconstruction target,
+- trained DPMN against the superpixel-perturbed background target instead of directly copying every original pixel,
+- added online background mining from reconstruction residual, local residual context, spectral contrast, and abundance entropy,
+- smoothed the mined background confidence by superpixel labels,
+- kept final anomaly scoring against the original HSI image so anomaly evidence is not removed by the pooled target,
+- kept random blindspot disabled for this mode.
+
+Initial default SP-IMP-DPMN run used full superpixel target strength and 1500 iterations. It was mixed:
+
+```text
+1:             auc=0.795791333202
+3:             auc=0.873732909161
+abu_airport_1: auc=0.823873500631
+abu_airport_2: auc=0.702917682690
+abu_airport_3: auc=0.686721919694
+```
+
+This was better than the failed `prior_blindspot` behavior on some hard samples, especially sample `3`, but it was still below the historical strong baseline level around `0.94-0.95` mean AUC.
+
+A tuned configuration was then tested on the first five samples:
+
+```text
+num_iter=800
+sp_target_weight=0.6
+residual_weight=0.8
+contrast_weight=0.15
+uncertainty_weight=0.05
+```
+
+Rationale:
+
+- reduce full superpixel target strength so fine anomaly evidence is not over-smoothed,
+- stop earlier to reduce late identity-mapping recovery,
+- make residual score dominant because it was more reliable than uncertainty-heavy fusion in the first run.
+
+Tuned five-sample validation:
+
+```text
+sample_count: 5
+mean_auc: 0.903437982006
+1:             auc=0.937329537655
+3:             auc=0.932469461898
+abu_airport_1: auc=0.891044231376
+abu_airport_2: auc=0.840539127188
+abu_airport_3: auc=0.915807551912
+```
+
+The tuned configuration was then made the default for `sp_imp_dpmn`, so the target command below now uses the tuned defaults without extra CLI flags:
+
+```bash
+python train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn
+```
+
+Full tuned run result:
+
+```text
+sample_count: 15
+mean_auc: 0.916926731476
+mean_stop_iteration: 800.00
+
+1:             auc=0.934602140142
+3:             auc=0.936252428315
+abu_airport_1: auc=0.892794434298
+abu_airport_2: auc=0.886220462854
+abu_airport_3: auc=0.903056070852
+abu_airport_4: auc=0.955323608317
+abu_beach_1:   auc=0.956093917905
+abu_beach_2:   auc=0.838357343083
+abu_beach_3:   auc=0.958590813531
+abu_beach_4:   auc=0.954238168163
+abu_urban_1:   auc=0.990849136979
+abu_urban_2:   auc=0.639632366192
+abu_urban_3:   auc=0.963662970524
+abu_urban_4:   auc=0.982919604417
+abu_urban_5:   auc=0.961307506566
+```
+
+Assessment:
+
+- SP-IMP-DPMN is a real improvement over the failed random blindspot route.
+- The tuned configuration is much stronger than the first SP-IMP-DPMN attempt.
+- Full mean AUC `0.9169` is still below the strongest historical baseline files around `0.94-0.95`.
+- The main failure cases are `abu_urban_2` and, secondarily, `abu_beach_2`.
+- Next recommended step is sample-adaptive fusion or sample-adaptive superpixel strength, starting with diagnosis of `abu_urban_2` score components and mask history.
+
+Generated artifacts from the full tuned run:
+
+```text
+results_sp_imp_dpmn/batch_summary_sp_imp_dpmn.txt
+results_sp_imp_dpmn/run_sp_imp_dpmn_tuned_full_log.md
+results_sp_imp_dpmn/score_components/sp_imp_dpmn/*.mat
+results_sp_imp_dpmn/mask_history/sp_imp_dpmn/*.mat
+results_sp_imp_dpmn/training_curves/*.png
+```
+
