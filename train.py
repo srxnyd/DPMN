@@ -92,6 +92,8 @@ def save_score_components(output_dir, sample_id, score_maps, weights):
     }
     if "highfreq_score" in score_maps and score_maps["highfreq_score"] is not None:
         save_data["highfreq_score"] = np.asarray(score_maps["highfreq_score"], dtype=np.float32)
+    if "highfreq_alpha" in score_maps and score_maps["highfreq_alpha"] is not None:
+        save_data["highfreq_alpha"] = np.asarray(score_maps["highfreq_alpha"], dtype=np.float32)
     scipy.io.savemat(mat_path, save_data)
     return mat_path
 
@@ -882,11 +884,53 @@ def compute_highfreq_score(residual_score, mode="none", wavelet="haar", level=1)
     raise ValueError(f"Unknown high-frequency score mode: {mode}")
 
 
-def fuse_with_highfreq_score(base_score, highfreq_score, highfreq_weight):
-    if highfreq_score is None or highfreq_weight <= 0.0:
-        return base_score
-    alpha = min(1.0, max(0.0, float(highfreq_weight)))
-    return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score)
+def compute_highfreq_adaptive_alpha(
+    base_score,
+    highfreq_score,
+    low_alpha=0.1,
+    high_alpha=0.4,
+    top_overlap_threshold=0.20,
+    rank_corr_threshold=0.15,
+):
+    top_overlap = compute_top_overlap(base_score, highfreq_score, top_fraction=0.05)
+    rank_corr = compute_rank_correlation(base_score, highfreq_score)
+    use_high_alpha = bool((top_overlap >= top_overlap_threshold and rank_corr >= rank_corr_threshold).item())
+    alpha = high_alpha if use_high_alpha else low_alpha
+    diagnostics = {
+        "top_overlap": float(top_overlap.item()),
+        "rank_corr": float(rank_corr.item()),
+        "use_high_alpha": float(use_high_alpha),
+    }
+    return float(alpha), diagnostics
+
+
+def fuse_with_highfreq_score(
+    base_score,
+    highfreq_score,
+    highfreq_weight,
+    fusion_mode="fixed",
+    adaptive_low_alpha=0.1,
+    adaptive_high_alpha=0.4,
+    adaptive_top_overlap_threshold=0.20,
+    adaptive_rank_corr_threshold=0.15,
+):
+    if highfreq_score is None:
+        return base_score, None, {}
+    if fusion_mode == "adaptive":
+        alpha, diagnostics = compute_highfreq_adaptive_alpha(
+            base_score,
+            highfreq_score,
+            low_alpha=adaptive_low_alpha,
+            high_alpha=adaptive_high_alpha,
+            top_overlap_threshold=adaptive_top_overlap_threshold,
+            rank_corr_threshold=adaptive_rank_corr_threshold,
+        )
+    else:
+        alpha = min(1.0, max(0.0, float(highfreq_weight)))
+        diagnostics = {}
+    if alpha <= 0.0:
+        return base_score, alpha, diagnostics
+    return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score), alpha, diagnostics
 
 
 def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights, adaptive=False):
@@ -956,6 +1000,11 @@ def compute_final_artifacts(
     highfreq_weight=0.0,
     highfreq_wavelet="haar",
     highfreq_level=1,
+    highfreq_fusion_mode="fixed",
+    highfreq_adaptive_low_alpha=0.1,
+    highfreq_adaptive_high_alpha=0.4,
+    highfreq_adaptive_top_overlap=0.20,
+    highfreq_adaptive_rank_corr=0.15,
 ):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
@@ -977,15 +1026,27 @@ def compute_final_artifacts(
             weights=weights,
             adaptive=adaptive_score_fusion,
         )
-        fused_score = fuse_with_highfreq_score(fused_score, highfreq_score, highfreq_weight)
+        fused_score, highfreq_alpha, highfreq_diagnostics = fuse_with_highfreq_score(
+            fused_score,
+            highfreq_score,
+            highfreq_weight,
+            fusion_mode=highfreq_fusion_mode,
+            adaptive_low_alpha=highfreq_adaptive_low_alpha,
+            adaptive_high_alpha=highfreq_adaptive_high_alpha,
+            adaptive_top_overlap_threshold=highfreq_adaptive_top_overlap,
+            adaptive_rank_corr_threshold=highfreq_adaptive_rank_corr,
+        )
 
     highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
+    highfreq_alpha_np = None if highfreq_alpha is None else np.asarray([highfreq_alpha], dtype=np.float32)
     return {
         "background_img": out_h.detach().cpu().squeeze(0).numpy(),
         "residual_score": residual_score.detach().cpu().squeeze().numpy(),
         "contrast_score": contrast_score.detach().cpu().squeeze().numpy(),
         "uncertainty_score": uncertainty_score.detach().cpu().squeeze().numpy(),
         "highfreq_score": highfreq_score_np,
+        "highfreq_alpha": highfreq_alpha_np,
+        "highfreq_diagnostics": highfreq_diagnostics,
         "fused_score": fused_score.detach().cpu().squeeze().numpy(),
         "mask": mask_var.detach().cpu().squeeze().numpy(),
     }
@@ -1100,6 +1161,11 @@ def run_single_sample(
     highfreq_weight = float(mode_config.get("highfreq_weight", 0.0))
     highfreq_wavelet = mode_config.get("highfreq_wavelet", "haar")
     highfreq_level = int(mode_config.get("highfreq_level", 1))
+    highfreq_fusion_mode = mode_config.get("highfreq_fusion_mode", "fixed")
+    highfreq_adaptive_low_alpha = float(mode_config.get("highfreq_adaptive_low_alpha", 0.1))
+    highfreq_adaptive_high_alpha = float(mode_config.get("highfreq_adaptive_high_alpha", 0.4))
+    highfreq_adaptive_top_overlap = float(mode_config.get("highfreq_adaptive_top_overlap", 0.20))
+    highfreq_adaptive_rank_corr = float(mode_config.get("highfreq_adaptive_rank_corr", 0.15))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1302,6 +1368,11 @@ def run_single_sample(
                 highfreq_weight=highfreq_weight,
                 highfreq_wavelet=highfreq_wavelet,
                 highfreq_level=highfreq_level,
+                highfreq_fusion_mode=highfreq_fusion_mode,
+                highfreq_adaptive_low_alpha=highfreq_adaptive_low_alpha,
+                highfreq_adaptive_high_alpha=highfreq_adaptive_high_alpha,
+                highfreq_adaptive_top_overlap=highfreq_adaptive_top_overlap,
+                highfreq_adaptive_rank_corr=highfreq_adaptive_rank_corr,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1320,6 +1391,7 @@ def run_single_sample(
                     "contrast_score": final_artifacts["contrast_score"],
                     "uncertainty_score": final_artifacts["uncertainty_score"],
                     "highfreq_score": final_artifacts["highfreq_score"],
+                    "highfreq_alpha": final_artifacts["highfreq_alpha"],
                     "fused_score": final_artifacts["fused_score"],
                 },
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
@@ -1360,6 +1432,13 @@ def run_single_sample(
             print(f"Saved residual PNG: {detection_residual_path}")
             print(f"Saved overlay PNG: {detection_overlay_path}")
             print(f"Saved zoom PNG: {detection_zoom_path}")
+            if final_artifacts.get("highfreq_alpha") is not None:
+                diagnostics = final_artifacts.get("highfreq_diagnostics", {})
+                print(
+                    f"highfreq alpha: {float(final_artifacts['highfreq_alpha'][0]):.6f}; "
+                    f"top_overlap: {diagnostics.get('top_overlap', 0.0):.6f}; "
+                    f"rank_corr: {diagnostics.get('rank_corr', 0.0):.6f}"
+                )
             print(f"Saved score components MAT: {score_mat_path}")
             if mask_history_path is not None:
                 print(f"Saved mask history MAT: {mask_history_path}")
@@ -1421,6 +1500,36 @@ def parse_args():
         type=float,
         default=0.0,
         help="Alpha for final fusion: (1-alpha) * fused_score + alpha * highfreq_score.",
+    )
+    parser.add_argument(
+        "--highfreq-fusion-mode",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="Use a fixed high-frequency alpha or gate it by agreement with the base score.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-low-alpha",
+        type=float,
+        default=0.1,
+        help="Low alpha used by adaptive high-frequency fusion when agreement is weak.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-high-alpha",
+        type=float,
+        default=0.4,
+        help="High alpha used by adaptive high-frequency fusion when agreement is strong.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-top-overlap",
+        type=float,
+        default=0.20,
+        help="Top-5-percent overlap threshold for adaptive high-frequency fusion.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-rank-corr",
+        type=float,
+        default=0.15,
+        help="Rank correlation threshold for adaptive high-frequency fusion.",
     )
     parser.add_argument(
         "--highfreq-wavelet",
@@ -1632,6 +1741,11 @@ def main():
     mode_config["uncertainty_weight"] = uncertainty_weight / weight_sum
     mode_config["highfreq_score_mode"] = args.highfreq_score_mode
     mode_config["highfreq_weight"] = min(1.0, max(0.0, float(args.highfreq_weight)))
+    mode_config["highfreq_fusion_mode"] = args.highfreq_fusion_mode
+    mode_config["highfreq_adaptive_low_alpha"] = min(1.0, max(0.0, float(args.highfreq_adaptive_low_alpha)))
+    mode_config["highfreq_adaptive_high_alpha"] = min(1.0, max(0.0, float(args.highfreq_adaptive_high_alpha)))
+    mode_config["highfreq_adaptive_top_overlap"] = float(args.highfreq_adaptive_top_overlap)
+    mode_config["highfreq_adaptive_rank_corr"] = float(args.highfreq_adaptive_rank_corr)
     mode_config["highfreq_wavelet"] = args.highfreq_wavelet
     mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)

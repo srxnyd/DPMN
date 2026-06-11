@@ -1102,3 +1102,91 @@ else:
 ```
 
 This directly targets the observed conflict: `sample 3` and `abu_beach_2` are harmed by over-weighting high-frequency residual globally, while airport samples benefit from stronger high-frequency contribution.
+
+
+### Execution update: first adaptive high-frequency gate
+
+Date: 2026-06-12.
+
+After committing the fixed high-frequency score work locally, pushing to GitHub was attempted but failed because the current environment does not have valid GitHub credentials:
+
+```text
+remote: Repository not found.
+fatal: Authentication failed for 'https://github.com/srxnyd/DPMN.git/'
+```
+
+Local commit created before the push attempt:
+
+```text
+960df46 Add high-frequency residual score experiments
+```
+
+The next score-side step was implemented in `train.py`: adaptive high-frequency fusion. New behavior:
+
+```text
+base_score = adaptive residual/contrast/uncertainty fusion
+hf_score = stationary Haar or pywt high-frequency residual score
+agreement = top-5-percent overlap + rank correlation between base_score and hf_score
+alpha_eff = high alpha if agreement is strong, otherwise low alpha
+final_score = normalize((1 - alpha_eff) * base_score + alpha_eff * hf_score)
+```
+
+New CLI options:
+
+```bash
+--highfreq-fusion-mode fixed|adaptive
+--highfreq-adaptive-low-alpha 0.1
+--highfreq-adaptive-high-alpha 0.4
+--highfreq-adaptive-top-overlap 0.20
+--highfreq-adaptive-rank-corr 0.15
+```
+
+Smoke test passed:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids 1 --num-iter 2 --results-dir /tmp/dpmn_hf_gating_smoke --highfreq-score-mode stationary_haar --highfreq-fusion-mode adaptive --highfreq-adaptive-low-alpha 0.1 --highfreq-adaptive-high-alpha 0.4 --log-interval 1
+```
+
+The first targeted adaptive-gate run also completed:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids 3,abu_beach_2,abu_airport_1,abu_airport_2,abu_beach_3 --results-dir results_sp_imp_dpmn_stationary_hf_adaptive_gate_targeted --highfreq-score-mode stationary_haar --highfreq-fusion-mode adaptive --highfreq-adaptive-low-alpha 0.1 --highfreq-adaptive-high-alpha 0.4
+```
+
+AUC results:
+
+```text
+mean_auc: 0.921036692629
+3: 0.918198644555
+abu_airport_1: 0.934982497971
+abu_airport_2: 0.925320402444
+abu_beach_2: 0.835018360991
+abu_beach_3: 0.991663557186
+```
+
+Gate diagnostics showed the current agreement rule is too permissive. It selected alpha `0.4` for every targeted sample:
+
+```text
+3: alpha=0.4, top_overlap=0.498000, rank_corr=0.699641
+abu_airport_1: alpha=0.4, top_overlap=0.600000, rank_corr=0.614500
+abu_airport_2: alpha=0.4, top_overlap=0.506000, rank_corr=0.626399
+abu_beach_2: alpha=0.4, top_overlap=0.626000, rank_corr=0.639749
+abu_beach_3: alpha=0.4, top_overlap=0.540000, rank_corr=0.625365
+```
+
+Interpretation:
+
+- Agreement between `base_score` and `hf_score` is not enough to decide whether high alpha is safe.
+- `sample 3` and `abu_beach_2` can have high agreement but still lose AUC when high-frequency score is over-weighted.
+- The first adaptive gate did not beat the best fixed targeted alpha (`0.3`, mean AUC `0.922560467721`).
+
+Next refinement should not be a simple agreement gate. It needs an additional protective signal, likely one of:
+
+```text
+1. scale/normalization guard for non-ABU sample 3;
+2. high-frequency concentration or entropy guard to detect diffuse edge response;
+3. per-pixel/soft alpha map instead of sample-level alpha;
+4. fallback to lower alpha when hf_score is too globally correlated or too spatially diffuse.
+```
+
+The current adaptive gate code remains useful as infrastructure because it saves `highfreq_alpha` and prints diagnostic agreement values, but the decision rule needs refinement before a full adaptive-gate run.
