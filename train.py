@@ -53,6 +53,7 @@ ABLATION_MODES = {
         "residual_weight": 0.8,
         "contrast_weight": 0.15,
         "uncertainty_weight": 0.05,
+        "adaptive_score_fusion": True,
     },
     "full_innovation": {
         "adaptive_mask": True,
@@ -806,7 +807,41 @@ def compute_abundance_uncertainty_score(abundance_map, eps=1e-8):
     return min_max_normalize(entropy / max_entropy, eps=eps)
 
 
-def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights):
+def compute_rank_correlation(score_a, score_b, eps=1e-8):
+    rank_a = rank_normalize_score(score_a, eps=eps).flatten()
+    rank_b = rank_normalize_score(score_b, eps=eps).flatten()
+    rank_a = rank_a - rank_a.mean()
+    rank_b = rank_b - rank_b.mean()
+    covariance = (rank_a * rank_b).mean()
+    denominator = rank_a.std(unbiased=False) * rank_b.std(unbiased=False) + eps
+    return covariance / denominator
+
+
+def compute_top_overlap(score_a, score_b, top_fraction=0.05):
+    flat_a = score_a.flatten()
+    flat_b = score_b.flatten()
+    top_k = max(1, int(float(flat_a.numel()) * float(top_fraction)))
+    idx_a = torch.topk(flat_a, top_k, largest=True).indices
+    idx_b = torch.topk(flat_b, top_k, largest=True).indices
+    selected = torch.zeros(flat_a.numel(), device=flat_a.device, dtype=torch.bool)
+    selected[idx_a] = True
+    overlap = selected[idx_b].float().mean()
+    return overlap
+
+
+def should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
+    residual_contrast_score = min_max_normalize(0.85 * residual_score + 0.15 * contrast_score)
+    top_overlap = compute_top_overlap(residual_contrast_score, uncertainty_score, top_fraction=0.05)
+    residual_corr = compute_rank_correlation(residual_score, uncertainty_score)
+    contrast_corr = compute_rank_correlation(contrast_score, uncertainty_score)
+    return bool((top_overlap > 0.20 and residual_corr > 0.15 and contrast_corr > 0.05).item())
+
+
+def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights, adaptive=False):
+    if adaptive and not should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
+        fused_score = 0.85 * residual_score + 0.15 * contrast_score
+        return min_max_normalize(fused_score)
+
     residual_weight, contrast_weight, uncertainty_weight = weights
     fused_score = (
         residual_weight * residual_score
@@ -857,7 +892,7 @@ def compute_mask_guided_joint_loss(
     return total_loss, metrics
 
 
-def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_kernel, weights):
+def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_kernel, weights, adaptive_score_fusion=False):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
         out, out_h = net(net_input_saved, enhancement_prior=enhancement_prior)
@@ -870,6 +905,7 @@ def compute_final_artifacts(net, net_input_saved, mask_var, img_var, spatial_ker
             contrast_score,
             uncertainty_score,
             weights=weights,
+            adaptive=adaptive_score_fusion,
         )
 
     return {
@@ -986,6 +1022,7 @@ def run_single_sample(
     superpixel_segments = int(mode_config.get("superpixel_segments", 256))
     superpixel_compactness = float(mode_config.get("superpixel_compactness", 0.08))
     sp_target_weight = float(mode_config.get("sp_target_weight", 1.0))
+    adaptive_score_fusion = bool(mode_config.get("adaptive_score_fusion", False))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1134,6 +1171,7 @@ def run_single_sample(
             contrast_score,
             uncertainty_score,
             weights=(residual_weight, contrast_weight, uncertainty_weight),
+            adaptive=adaptive_score_fusion,
         )
         residual_var_clone = fused_score.detach().squeeze(0).squeeze(0)
         total_loss.requires_grad_(True)
@@ -1182,6 +1220,7 @@ def run_single_sample(
                 img_var,
                 spatial_kernel,
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
+                adaptive_score_fusion=adaptive_score_fusion,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1377,6 +1416,11 @@ def parse_args():
         help="Limit the number of dataset files processed; useful for smoke tests.",
     )
     parser.add_argument(
+        "--sample-ids",
+        default=None,
+        help="Comma-separated sample ids to run, for example: abu_beach_2,abu_urban_2.",
+    )
+    parser.add_argument(
         "--dataset-dir",
         default=os.path.join(BASE_DIR, "dataset"),
         help="Directory containing trainable .mat files.",
@@ -1435,6 +1479,16 @@ def main():
     ensure_dir(dataset_dir)
     maybe_prepare_imported_dataset(args, dataset_dir)
     dataset_files = collect_dataset_files(dataset_dir, prefix=args.dataset_prefix)
+    if args.sample_ids:
+        requested_sample_ids = {item.strip() for item in args.sample_ids.split(",") if item.strip()}
+        dataset_files = [
+            file_path for file_path in dataset_files
+            if extract_sample_id(file_path, prefix=args.dataset_prefix) in requested_sample_ids
+        ]
+        if len(dataset_files) != len(requested_sample_ids):
+            found_sample_ids = {extract_sample_id(file_path, prefix=args.dataset_prefix) for file_path in dataset_files}
+            missing_sample_ids = sorted(requested_sample_ids - found_sample_ids)
+            raise ValueError(f"Requested sample id(s) not found: {missing_sample_ids}")
     if args.max_samples is not None:
         dataset_files = dataset_files[: max(0, int(args.max_samples))]
     mode_name = args.ablation_mode

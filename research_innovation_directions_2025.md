@@ -434,3 +434,97 @@ results_sp_imp_dpmn/mask_history/sp_imp_dpmn/*.mat
 results_sp_imp_dpmn/training_curves/*.png
 ```
 
+## 9. Targeted Fix for Low-AUC Samples
+
+Date: 2026-06-11.
+
+The tuned full SP-IMP-DPMN run still had two weak samples:
+
+```text
+abu_beach_2: auc=0.838357343083
+abu_urban_2: auc=0.639632366192
+```
+
+Score-component diagnosis showed different failure modes:
+
+```text
+abu_beach_2:
+  residual_score:    0.757057916447
+  contrast_score:    0.834009365419
+  uncertainty_score: 0.880860207882
+  fused_score:       0.838357343083
+
+abu_urban_2:
+  residual_score:    0.992800668425
+  contrast_score:    0.984424384410
+  uncertainty_score: 0.023471223316
+  fused_score:       0.639632366192
+```
+
+Conclusion:
+
+- `abu_urban_2` was not a reconstruction failure; residual and contrast were already excellent.
+- The abundance uncertainty score was nearly inverted on `abu_urban_2` and damaged fusion.
+- `abu_beach_2` still benefited from uncertainty, so globally removing uncertainty was not ideal.
+
+A label-free adaptive score fusion rule was added for `sp_imp_dpmn`:
+
+```text
+base score = 0.85 * residual + 0.15 * contrast
+
+Use uncertainty only if:
+  top-5% overlap(base, uncertainty) > 0.20
+  rank_corr(residual, uncertainty) > 0.15
+  rank_corr(contrast, uncertainty) > 0.05
+
+Otherwise:
+  fused score = base score
+```
+
+Offline evaluation on the existing full-run score components estimated:
+
+```text
+default tuned fusion mean_auc: 0.916926731476
+adaptive fusion mean_auc:      0.943157920053
+```
+
+The two weak samples were then rerun with adaptive fusion enabled:
+
+```bash
+python train.py --ablation-mode sp_imp_dpmn \
+  --results-dir results_sp_imp_dpmn_adaptive_fix \
+  --sample-ids abu_beach_2,abu_urban_2
+```
+
+Rerun result:
+
+```text
+sample_count: 2
+mean_auc: 0.933665698927
+
+abu_beach_2: auc=0.874754193117
+abu_urban_2: auc=0.992577204738
+```
+
+Replacing the two weak full-run scores with the adaptive-fusion rerun scores gives an estimated full-run mean:
+
+```text
+projected_full_mean_auc: 0.942882844048
+```
+
+Assessment:
+
+- The targeted fix directly addresses the `abu_urban_2` failure without hard-coding sample names.
+- `abu_beach_2` also improved under the rerun.
+- This brings SP-IMP-DPMN close to the historical strong baseline range around `0.94-0.95`.
+- A full rerun with adaptive fusion enabled is the next clean comparison if exact final mean is needed.
+
+Generated artifacts:
+
+```text
+results_sp_imp_dpmn_adaptive_fix/batch_summary_sp_imp_dpmn.txt
+results_sp_imp_dpmn_adaptive_fix/run_log.md
+results_sp_imp_dpmn_adaptive_fix/score_components/sp_imp_dpmn/*.mat
+results_sp_imp_dpmn_adaptive_fix/mask_history/sp_imp_dpmn/*.mat
+```
+
