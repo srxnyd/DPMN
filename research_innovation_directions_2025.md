@@ -2318,3 +2318,714 @@ Next recommended optimization:
 
 4. Add localization metrics for cases like `abu_urban_4`, because ROC-AUC can be high even when visually important connected anomaly regions are not bright enough.
 5. Only if conservative training guard is unstable or hurts full mean should AGM/DPMN-adjacent modules be considered. The first candidate should be anti-identity / error-adaptive training, not a broad AGM/DPMN backbone rewrite.
+
+
+### Execution update: conservative edge-aware training guard stability check
+
+Date: 2026-06-12.
+
+Following the previous recommendation, the conservative `abu_beach_2` edge-aware training guard was repeated twice with the same settings:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_edge_training_guard_beach2_conservative_r1 --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --edge-training-guard --edge-training-guard-quantile 0.90 --edge-training-guard-strength 0.2 --edge-training-guard-base-quantile 0.70
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_edge_training_guard_beach2_conservative_r2 --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --edge-training-guard --edge-training-guard-quantile 0.90 --edge-training-guard-strength 0.2 --edge-training-guard-base-quantile 0.70
+```
+
+Results:
+
+```text
+previous conservative check: auc=0.867262262050
+r1 conservative repeat:      auc=0.860280133953, selected=soft_map, alpha_mean=0.107252
+r2 conservative repeat:      auc=0.861774680224, selected=soft_map, alpha_mean=0.114392
+repeat mean:                 auc=0.861027407089
+repeat std:                  auc=0.000747273135
+```
+
+Comparison anchors:
+
+```text
+adaptive-fusion full-run abu_beach_2:          0.863029230051
+stationary_hf_a04 full-run abu_beach_2:        0.836264574100
+best single protected/edge-side check nearby:  0.867841790303
+```
+
+Interpretation:
+
+- The conservative edge-aware training guard is stable across the two repeats, but the stable value is around `0.861`, not the earlier single-run `0.867`.
+- It clearly avoids the fixed high-frequency alpha failure on `abu_beach_2`, but it does not reliably beat the adaptive-fusion full-run `abu_beach_2` score.
+- Therefore, a full 15-sample edge-training-guard rerun is not justified yet. It is likely to add compute without a strong enough expected gain.
+
+Next recommended action:
+
+```text
+Do not run the full edge-training-guard comparison yet.
+Instead, diagnose why abu_beach_2 remains capped around 0.86:
+  1. compare base_score, highfreq_score, alpha_map, and edge_score against the ground-truth airplane pixels,
+  2. quantify how much shoreline pixels occupy the top-K score budget,
+  3. add a compact-target preserving gate if the airplane evidence is being diluted by broad shoreline edges.
+```
+
+Only after this diagnosis produces a rule that improves `abu_beach_2` beyond the adaptive-fusion baseline with repeatable margin should the full-run comparison be launched.
+
+
+### Conversation update: permission note and Turbo-GoDec reference check
+
+Date: 2026-06-12.
+
+Conversation note:
+
+```text
+User asked how to grant permissions.
+Answer: the environment shows an approval prompt when a command needs escalated execution. Allowing the prompt lets the command run. For repeated training runs, approving a scoped prefix such as `python -u train.py` is reasonable.
+```
+
+The latest executed work before this note was:
+
+```text
+1. Read the research plan.
+2. Identified the current next step as repeating the conservative edge-aware training guard for abu_beach_2.
+3. Ran two repeats:
+   - results_sp_imp_dpmn_edge_training_guard_beach2_conservative_r1: auc=0.860280133953
+   - results_sp_imp_dpmn_edge_training_guard_beach2_conservative_r2: auc=0.861774680224
+4. Updated the conclusion: do not launch a full 15-sample edge-training-guard run yet; first diagnose top-K score budget and compact target preservation.
+```
+
+User then asked whether the following work is useful as a reference:
+
+```text
+Turbo-GoDec: Exploiting the Cluster Sparsity Prior for Hyperspectral Anomaly Detection
+arXiv: https://arxiv.org/abs/2601.12337
+Code: https://github.com/jiahuisheng/Turbo-GoDec
+```
+
+Reference summary from the arXiv page:
+
+```text
+Submitted: 2026-01-18
+Task: hyperspectral anomaly detection
+Core idea: anomalies are not only sparse; they often form small spatial clusters.
+Method: combine cluster sparsity prior with GoDec, especially the sparse S-step.
+Modeling: Markov random field / factor graph message passing estimates marginal anomaly probabilities.
+Reported claim: better small-size anomaly detection than vanilla GoDec/LSMAD and several SOTA methods on three real HSI datasets.
+```
+
+Assessment for the current DPMN/SP-IMP-DPMN work:
+
+This paper is relevant and worth borrowing from, but not as a replacement for SP-IMP-DPMN. The most useful concept is the `cluster sparsity prior`: true targets such as aircraft should appear as compact connected groups, while shoreline or texture edges are broader, elongated, and less compact. This matches the current `abu_beach_2` failure diagnosis, where broad shoreline edges consume score budget and dilute the compact airplane target.
+
+Recommended borrowing route:
+
+```text
+Do not port full Turbo-GoDec first.
+Add a light cluster-sparsity / compact-target gate on top of current score components.
+```
+
+Possible integration into current code:
+
+```text
+base_score = adaptive residual/contrast/uncertainty score
+hf_score = stationary Haar high-frequency score
+edge_score = input Sobel/texture edge response
+cluster_prob = compact connected-component or MRF-smoothed target probability
+final_score = base_score + gated high-frequency support where cluster_prob is high
+suppress broad high-edge regions where cluster_prob is low
+```
+
+Practical first experiment:
+
+```text
+1. Threshold top candidate pixels from base_score and highfreq_score.
+2. Build connected components or superpixel groups.
+3. Compute compactness features:
+   - area
+   - bbox aspect ratio
+   - perimeter-to-area ratio
+   - overlap with highfreq_score
+   - overlap with edge_score
+4. Boost compact components with base/HF agreement.
+5. Downweight broad shoreline-like components with high edge response but low compactness.
+6. Test first on abu_beach_2, then on sample 3 and airport samples.
+```
+
+Why this is a better next step than full edge-training-guard rerun:
+
+```text
+The repeated conservative edge-training guard stabilized around auc=0.861, which does not reliably beat the adaptive-fusion baseline of 0.863 on abu_beach_2.
+Turbo-GoDec points to the missing prior: anomaly support should be spatially clustered and compact, not just high-frequency or edge-like.
+A cluster/compactness gate directly targets the current failure mode without modifying AGM/DPMN internals.
+```
+
+Updated next action:
+
+```text
+Implement a post-hoc compact cluster gate for abu_beach_2 using saved score components first.
+If the post-hoc gate improves abu_beach_2 repeatably without hurting airport/urban samples, add it to train.py as a switchable final-score option.
+Only after that consider a training-side MRF or Turbo-GoDec-style sparse prior.
+```
+
+
+### Implementation update: compact-cluster gate from Turbo-GoDec prior
+
+Date: 2026-06-12.
+
+A switchable Turbo-GoDec-inspired compact-cluster final-score gate was added to `train.py`. It is disabled by default and does not modify the DPMN/AGM backbone or training loss unless explicitly enabled.
+
+New CLI options:
+
+```bash
+--compact-cluster-gate
+--compact-cluster-mode components|mrf
+--compact-cluster-candidate-quantile
+--compact-cluster-boost-weight
+--compact-cluster-suppress-weight
+--compact-cluster-min-area
+--compact-cluster-max-area-fraction
+--compact-cluster-min-aspect
+--compact-cluster-min-fill
+--compact-cluster-mrf-highfreq-weight
+--compact-cluster-mrf-edge-weight
+--compact-cluster-mrf-smooth-weight
+--compact-cluster-mrf-iterations
+--compact-cluster-mrf-fusion-weight
+```
+
+Saved score-component additions:
+
+```text
+compact_cluster_score
+compact_suppression_score
+edge_score
+```
+
+Implemented modes:
+
+```text
+components:
+  connected-component compactness gate using area, bbox aspect ratio, bbox fill ratio,
+  base/high-frequency agreement, and input edge score.
+
+mrf:
+  lightweight Turbo-GoDec-style cluster probability using base rank, high-frequency rank,
+  optional edge penalty, and 4-neighbor iterative smoothing.
+```
+
+Smoke tests:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --num-iter 2 --results-dir /tmp/dpmn_compact_cluster_smoke --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --compact-cluster-gate --log-interval 1
+
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --num-iter 2 --results-dir /tmp/dpmn_compact_mrf_smoke --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --compact-cluster-gate --compact-cluster-mode mrf --log-interval 1
+```
+
+Both completed successfully. `train.py` syntax check also passed:
+
+```bash
+python -m py_compile train.py
+```
+
+Controlled `abu_beach_2` experiments:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_compact_cluster_beach2_check --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --compact-cluster-gate
+```
+
+Result:
+
+```text
+auc: 0.838497551531
+residual_score:            0.700912895944
+contrast_score:            0.834009365419
+uncertainty_score:         0.907169628475
+highfreq_score:            0.818530352729
+compact_cluster_score:     0.548482313020
+compact_suppression_score: 0.433557868953
+```
+
+A post-hoc sweep on this saved score map found that stronger component-gate settings could only reach about:
+
+```text
+best post-hoc component-gate auc: 0.844282223691
+```
+
+A tuned component-gate rerun was then tested:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_compact_cluster_beach2_tuned --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --compact-cluster-gate --compact-cluster-candidate-quantile 0.85 --compact-cluster-boost-weight 0.8 --compact-cluster-suppress-weight 0.6 --compact-cluster-max-area-fraction 0.06
+```
+
+Result:
+
+```text
+auc: 0.800170372212
+residual_score:            0.773961750125
+contrast_score:            0.834009365419
+uncertainty_score:         0.863280342119
+highfreq_score:            0.840378618388
+compact_cluster_score:     0.509543774341
+compact_suppression_score: 0.424219228414
+```
+
+A lightweight MRF mode was also tested. Post-hoc on the previous conservative edge-training-guard repeat `r2`, MRF smoothing gave a small possible gain:
+
+```text
+conservative r2 fused auc:      0.861774680224
+best post-hoc MRF fused auc:    0.869703152189
+best setting:
+  base_rank weight: 0.5
+  highfreq_rank weight: 0.4
+  edge penalty: 0.0
+  MRF fusion alpha: 0.1
+```
+
+A real training-entry rerun with conservative edge-training guard plus MRF mode was then executed:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_compact_mrf_beach2_check --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --edge-training-guard --edge-training-guard-quantile 0.90 --edge-training-guard-strength 0.2 --edge-training-guard-base-quantile 0.70 --compact-cluster-gate --compact-cluster-mode mrf --compact-cluster-mrf-highfreq-weight 0.4 --compact-cluster-mrf-edge-weight 0.0 --compact-cluster-mrf-smooth-weight 0.15 --compact-cluster-mrf-iterations 20 --compact-cluster-mrf-fusion-weight 0.1
+```
+
+Result:
+
+```text
+auc: 0.838816873114
+residual_score:        0.764858053472
+contrast_score:        0.834009365419
+uncertainty_score:     0.905266077741
+highfreq_score:        0.839512104915
+compact_cluster_score: 0.833156493849
+```
+
+Conclusion:
+
+- The Turbo-GoDec cluster-sparsity prior is conceptually relevant, but the current simple final-score gate is not yet robust.
+- The connected-component gate can identify compact candidates, but its compact score is poorly aligned with the true `abu_beach_2` target in the tested runs.
+- The MRF mode can slightly improve a fixed saved score map post-hoc, but the gain did not survive a fresh training-entry rerun.
+- Do not run a full 15-sample compact-cluster comparison yet.
+- Keep the code as an experimental, default-off switch for further analysis.
+
+Next recommended action:
+
+```text
+Use compact_cluster_score and edge_score only for visualization/diagnosis for now.
+Before another training run, inspect whether the MRF probability highlights the airplane or simply smooths shoreline evidence.
+If the probability is visually wrong, the next fix should use superpixel-level compactness or target-shape constraints rather than pixel connected components.
+```
+
+
+### Diagnosis update: compact-cluster visualization and top-K localization
+
+Date: 2026-06-13.
+
+The saved `compact_cluster_score`, `edge_score`, and related score components were diagnosed on `abu_beach_2` instead of launching another full run.
+
+Generated artifacts:
+
+```text
+results_compact_cluster_diagnosis/abu_beach_2_components_compact_diagnosis.png
+results_compact_cluster_diagnosis/abu_beach_2_mrf_compact_diagnosis.png
+results_compact_cluster_diagnosis/abu_beach_2_compact_cluster_diagnosis.txt
+```
+
+Key GT geometry:
+
+```text
+GT bbox: y=8..68, x=20..61
+GT anomaly pixels: 202
+```
+
+Connected-component compact gate diagnosis:
+
+```text
+fused_score:
+  auc=0.838497551531
+  precision@K=0.054455445545
+  topK_gt=11/202
+
+compact_cluster_score:
+  auc=0.548482313020
+  precision@K=0.148514851485
+  topK_gt=30/202
+  largest top-K component: overlap=14, area=170, bbox y=31..35, x=0..99
+
+edge_score:
+  auc=0.820990442584
+  precision@K=0.000000000000
+  topK_gt=0/202
+```
+
+Interpretation:
+
+The connected-component compact score does not primarily highlight the airplane. Its largest high-score component is a horizontal strip crossing the full image width. Although it overlaps 14 GT pixels, most of its 170 pixels are non-target background/shoreline-like structure. The edge score is also clearly not a target map: its top-K pixels contain zero GT anomaly pixels.
+
+MRF compact gate diagnosis:
+
+```text
+fused_score:
+  auc=0.838816873114
+  precision@K=0.039603960396
+  topK_gt=8/202
+
+compact_cluster_score:
+  auc=0.833156493849
+  precision@K=0.024752475248
+  topK_gt=5/202
+  largest top-K component: overlap=0, area=82, bbox y=0..17, x=0..15
+
+edge_score:
+  auc=0.820990442584
+  precision@K=0.000000000000
+  topK_gt=0/202
+```
+
+Interpretation:
+
+The MRF probability is also not highlighting the airplane. Its largest high-score component has zero GT overlap and lies outside the main GT bbox. This means the MRF smoothing is mostly propagating non-target shoreline/background evidence rather than forming a useful aircraft cluster prior.
+
+Decision:
+
+```text
+Stop tuning the current pixel-level compact-cluster gate.
+Do not run full 15-sample experiments with this gate.
+```
+
+Reason:
+
+```text
+The failure is not just a parameter issue. The diagnostic maps show that the cluster prior is attached to the wrong structures. More tuning of boost/suppress weights or MRF alpha would likely overfit one saved map and remain unstable across fresh DPMN runs.
+```
+
+What remains useful:
+
+```text
+Turbo-GoDec's cluster-sparsity idea remains conceptually useful,
+but it should not be used as this pixel-level final-score gate.
+```
+
+Recommended alternative if this direction is revisited:
+
+```text
+Use superpixel-level or object-level compactness instead of pixel connected components:
+  1. form candidate superpixels from SP-IMP labels,
+  2. score each superpixel by base/high-frequency/uncertainty agreement,
+  3. suppress long shoreline-like superpixel chains,
+  4. boost only small isolated superpixel groups with high internal score consistency.
+```
+
+For now, the stronger practical branch remains the existing adaptive fusion plus stationary high-frequency score. `compact_cluster_score` and `edge_score` should be kept only as diagnostic outputs, not as active score-fusion components.
+
+
+### Literature update after reverting pixel-level compact/MRF gate
+
+Date: 2026-06-13.
+
+Code status:
+
+```text
+train.py was restored from origin/main.
+The pixel-level compact-cluster / MRF final-score gate was removed from active code.
+Verification:
+  python -m py_compile train.py
+  grep compact_cluster / compact-cluster / mrf_fusion / Turbo-GoDec in train.py: no matches
+```
+
+The research log keeps the failed compact-gate diagnosis as a negative result, but the implementation is no longer in `train.py`.
+
+Recent literature checked:
+
+```text
+1. Overcoming the Identity Mapping Problem in Self-Supervised Hyperspectral Anomaly Detection, TGRS/arXiv 2025
+   Link: https://arxiv.org/abs/2504.04115
+   Useful ideas: superpixel pooling/uppooling, error-adaptive convolution, online background pixel mining.
+
+2. ACMamba: Fast Unsupervised Anomaly Detection via an Asymmetrical Consensus State Space Model, ACM MM 2025
+   Link: https://arxiv.org/html/2504.11781v1
+   Useful ideas: regional rather than dense-pixel training, regional spectral attribute learning, efficient state-space modeling.
+
+3. Dual-stream Background Modeling Network with Anomaly Suppression for Hyperspectral Anomaly Detection, IJAEOG 2026
+   Reference page: https://www.researchgate.net/publication/403234538_Dual-stream_Background_Modeling_Network_with_Anomaly_Suppression_for_Hyperspectral_Anomaly_Detection
+   Useful ideas: multi-directional masked convolution to suppress anomaly reconstruction, local/global dual-stream background modeling, coordinate-aware spatial attention.
+
+4. Beyond Reconstruction: Reconstruction-to-Vector Diffusion for Hyperspectral Anomaly Detection, arXiv 2026
+   Link: https://arxiv.org/abs/2604.11390
+   Useful ideas: move beyond scalar reconstruction residuals, use residual-guided generative/vector diffusion, address sub-pixel anomaly vanishing and confirmation bias.
+
+5. BSDM: Background Suppression Diffusion Model for Hyperspectral Anomaly Detection, TCSVT 2025 / arXiv
+   Link: https://arxiv.org/abs/2307.09861
+   Useful ideas: learn/suppress background distribution with diffusion, use background-suppressed prior as an external teacher or score branch.
+
+6. Frequency Domain Mask Guided Diffusion Model for Hyperspectral Anomaly Detection, IGARSS 2025
+   Reference page: https://www.researchgate.net/publication/397979597_Frequency_Domain_Mask_Guided_Diffusion_Model_for_Hyperspectral_Anomaly_Detection
+   Useful ideas: frequency-domain mask guidance and diffusion; supports the already validated high-frequency residual direction.
+
+7. Wavelet-based diffusion with spatial-frequency attention for hyperspectral anomaly detection, IJAEOG 2025
+   Reference via R2VD bibliography: https://arxiv.org/html/2604.11390v1
+   Useful ideas: wavelet/spatial-frequency attention for HAD; supports wavelet or stationary high-frequency branch, but with learned attention rather than fixed alpha.
+```
+
+Recommended directions for this project, ranked by fit and risk:
+
+```text
+1. Error-adaptive convolution inside AGM/DPMN
+2. Multi-directional anomaly-suppression masking during training
+3. Region/superpixel-level state-space or spectral-attribute branch
+4. Learned adaptive high-frequency attention, not fixed alpha
+5. Diffusion teacher / residual-guided purification branch
+```
+
+Detailed assessment:
+
+1. Error-adaptive convolution is the best next structural change.
+
+Reason:
+
+```text
+Current SP-IMP-DPMN already implemented two Super-AD/IMP pieces:
+  perturbation: superpixel pooling / region-level target
+  regularization: online background mining
+The missing piece is reconstruction-side error-adaptive convolution.
+```
+
+Expected role:
+
+```text
+Use current residual/background-confidence maps to modulate convolutional reconstruction,
+so high-error suspected anomaly regions are not copied as easily while background regions remain reconstructable.
+```
+
+Why this is better than more score post-processing:
+
+```text
+The failed compact/MRF gate showed that final-score heuristics attach to wrong structures.
+Error-adaptive convolution acts earlier, where anomaly leakage is created.
+```
+
+2. Multi-directional anomaly-suppression masking is a strong training-side fix.
+
+Reason:
+
+```text
+DSBMNet's multi-directional masked convolution is directly aimed at the AE failure mode:
+anomalies can be reconstructed too well.
+```
+
+Suggested DPMN integration:
+
+```text
+During training, add structured masks along horizontal, vertical, diagonal, and center-block directions.
+Use these masks only for suspected anomaly/high-residual pixels or after warmup.
+Keep random blindspot disabled as a global mechanism because prior_blindspot was unstable.
+```
+
+This is more promising than the old random blindspot because it is structured and anomaly-suppression oriented rather than random pixel corruption.
+
+3. Region-level ACMamba-style branch is useful, but should be added as a side branch.
+
+Reason:
+
+```text
+ACMamba argues that dense pixel modeling is unnecessary for homogeneous regions.
+Current SP-IMP-DPMN already has superpixels, so regional spectral attributes can be computed cheaply.
+```
+
+Suggested integration:
+
+```text
+Build region descriptors from superpixel-pooled HSI and abundance maps.
+Use a lightweight Mamba/state-space or even MLP branch to estimate region anomaly prior.
+Fuse region prior with residual/contrast only after calibration.
+```
+
+Risk:
+
+```text
+The current model/MambaHSI.py already exists but may not be optimized for this HAD setting.
+Start with region descriptors before rewriting backbone scanning.
+```
+
+4. Learned high-frequency attention is better than another fixed high-frequency alpha.
+
+Reason:
+
+```text
+Stationary Haar alpha=0.4 improved full mean AUC to 0.956469872526,
+but hurt sample 3 and abu_beach_2.
+This means high-frequency evidence is useful but sample/region dependent.
+```
+
+Suggested integration:
+
+```text
+Replace fixed/diagnostic alpha rules with a tiny learned or self-calibrated gate using:
+  residual_score
+  contrast_score
+  highfreq_score
+  uncertainty_score
+  edge_score
+  local entropy / concentration
+Train-free option: estimate reliability from score agreement and top-K concentration at superpixel level.
+```
+
+Avoid using pixel connected components; the diagnosis showed they lock onto shoreline/background structures.
+
+5. Diffusion teacher is publishable but higher cost.
+
+Reason:
+
+```text
+BSDM and R2VD indicate diffusion is moving from background suppression to residual-guided purification.
+This is novel, but expensive compared with the current DIP-style per-image optimization.
+```
+
+Suggested lightweight route:
+
+```text
+Do not train a full diffusion model first.
+Use diffusion-style idea as an external teacher/prior:
+  DPMN reconstruction B
+  residual/highfreq map R
+  teacher produces background-suppressed prior S
+  final or training weight uses S only if it agrees with residual/contrast
+```
+
+Current recommendation:
+
+```text
+Next implementation should not revisit pixel-level compact/MRF gate.
+Best immediate code task:
+  implement error-adaptive convolution or structured multi-directional anomaly-suppression masking,
+  test first on sample 3 and abu_beach_2,
+  then run targeted set: 3, abu_beach_2, abu_airport_1, abu_airport_2, abu_beach_3.
+```
+
+## 2026-06-13: three-component ablation decision
+
+Targeted set:
+
+```text
+3, abu_beach_2, abu_airport_1, abu_airport_2, abu_beach_3
+```
+
+Reference baseline:
+
+```text
+stationary Haar diagnostic alpha=0.3
+mean_auc: 0.922560467721
+per sample:
+  3: 0.923124970225
+  abu_airport_1: 0.920749064304
+  abu_airport_2: 0.926238736780
+  abu_beach_2: 0.850825789866
+  abu_beach_3: 0.991863777428
+```
+
+Ablation results:
+
+```text
+EAC only
+mean_auc: 0.919350421646
+per sample:
+  3: 0.915103811021
+  abu_airport_1: 0.931904846456
+  abu_airport_2: 0.918878147933
+  abu_beach_2: 0.837936717738
+  abu_beach_3: 0.992928585080
+
+MD suppression only
+mean_auc: 0.926733643516
+per sample:
+  3: 0.929840441393
+  abu_airport_1: 0.934175037202
+  abu_airport_2: 0.916080242941
+  abu_beach_2: 0.863565306316
+  abu_beach_3: 0.990007189727
+
+Region prior only
+mean_auc: 0.883080308523
+per sample:
+  3: 0.941861593539
+  abu_airport_1: 0.919395193565
+  abu_airport_2: 0.897514119970
+  abu_beach_2: 0.725242472196
+  abu_beach_3: 0.931388163343
+
+EAC + MD
+mean_auc: 0.917931636484
+per sample:
+  3: 0.909124112706
+  abu_airport_1: 0.925443046537
+  abu_airport_2: 0.923082542256
+  abu_beach_2: 0.841937584757
+  abu_beach_3: 0.990070896168
+
+EAC + MD + region prior
+mean_auc: 0.880490449758
+per sample:
+  3: 0.916891192076
+  abu_airport_1: 0.912110784181
+  abu_airport_2: 0.908338174300
+  abu_beach_2: 0.729737731887
+  abu_beach_3: 0.935374366348
+```
+
+Decision:
+
+```text
+Keep multi-directional anomaly-suppression masking as the only candidate for the next larger run.
+It improves targeted mean AUC from 0.922560 to 0.926734 and helps 3/5 samples, including abu_beach_2.
+
+Do not keep error-adaptive convolution as a main component.
+It is slightly below baseline by itself and hurts the stronger MD-only setting when combined.
+Leave it as a default-off diagnostic switch only if useful for future reconstruction-side experiments.
+
+Do not keep the current region/superpixel prior branch.
+The simple pooled score is not a real ACMamba-style learned regional branch and strongly fails on
+abu_beach_2 and abu_beach_3. Remove it from the main path or keep only as default-off diagnostic output.
+
+Do not run the full 15-sample experiment for EAC, region prior, or the three-component combination.
+The only justified next full run is MD suppression only.
+```
+
+## 2026-06-13: MD-only full 15-sample run
+
+Command:
+
+```text
+python -u train.py --ablation-mode sp_imp_dpmn --results-dir results_sp_imp_dpmn_md_only_full15 --multidir-suppression --multidir-suppression-strength 0.45 --multidir-suppression-quantile 0.88 --multidir-suppression-kernel 7 --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85
+```
+
+Result:
+
+```text
+sample_count: 15
+mean_auc: 0.958119941153
+mean_stop_iteration: 800.00
+mean_elapsed_seconds: 77.1436
+
+per sample:
+  1: 0.932095560370
+  3: 0.928377717904
+  abu_airport_1: 0.930877553436
+  abu_airport_2: 0.924751081536
+  abu_airport_3: 0.947419663695
+  abu_airport_4: 0.954092890677
+  abu_beach_1: 0.977957994938
+  abu_beach_2: 0.866870436278
+  abu_beach_3: 0.988942382075
+  abu_beach_4: 0.984730322229
+  abu_urban_1: 0.991606449781
+  abu_urban_2: 0.994053637838
+  abu_urban_3: 0.982284804058
+  abu_urban_4: 0.993836771962
+  abu_urban_5: 0.973901850518
+```
+
+Conclusion:
+
+```text
+MD-only is the only retained component from the three-part proposal.
+Full 15-sample mean AUC reaches 0.958119941153, above the previous recorded stationary-Haar full mean
+0.956469872526. Keep the implementation default-off for ablation control, but use it as the next
+recommended experiment setting.
+
+EAC and region prior remain excluded from the main path.
+```
+

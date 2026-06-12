@@ -96,6 +96,8 @@ def save_score_components(output_dir, sample_id, score_maps, weights):
         save_data["highfreq_alpha"] = np.asarray(score_maps["highfreq_alpha"], dtype=np.float32)
     if "highfreq_alpha_map" in score_maps and score_maps["highfreq_alpha_map"] is not None:
         save_data["highfreq_alpha_map"] = np.asarray(score_maps["highfreq_alpha_map"], dtype=np.float32)
+    if "region_prior_score" in score_maps and score_maps["region_prior_score"] is not None:
+        save_data["region_prior_score"] = np.asarray(score_maps["region_prior_score"], dtype=np.float32)
     scipy.io.savemat(mat_path, save_data)
     return mat_path
 
@@ -574,6 +576,44 @@ def make_blindspot_weight(base_mask, blindspot_ratio, guard_window, eps=1e-8):
     return blindspot_weight.clamp(0.0, 1.0)
 
 
+def make_multidirectional_suppression_weight(
+    base_mask,
+    anomaly_score,
+    quantile=0.88,
+    strength=0.55,
+    kernel_size=7,
+    eps=1e-8,
+):
+    if anomaly_score.dim() == 2:
+        anomaly_score = anomaly_score.view(1, 1, anomaly_score.shape[0], anomaly_score.shape[1])
+    if anomaly_score.dim() == 3:
+        anomaly_score = anomaly_score.unsqueeze(0)
+    if anomaly_score.shape[-2:] != base_mask.shape[-2:]:
+        anomaly_score = F.interpolate(anomaly_score, size=base_mask.shape[-2:], mode="bilinear", align_corners=False)
+    kernel_size = max(3, int(kernel_size))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    anomaly_rank = rank_normalize_score(anomaly_score)
+    threshold = torch.quantile(anomaly_rank.flatten(), min(0.99, max(0.5, float(quantile))))
+    seeds = (anomaly_rank >= threshold).float()
+
+    kernels = []
+    horizontal = torch.zeros(1, 1, kernel_size, kernel_size, device=base_mask.device, dtype=base_mask.dtype)
+    horizontal[:, :, kernel_size // 2, :] = 1.0
+    vertical = torch.zeros_like(horizontal)
+    vertical[:, :, :, kernel_size // 2] = 1.0
+    diag1 = torch.eye(kernel_size, device=base_mask.device, dtype=base_mask.dtype).view(1, 1, kernel_size, kernel_size)
+    diag2 = torch.flip(diag1, dims=[-1])
+    center = torch.ones_like(horizontal)
+    kernels.extend([horizontal, vertical, diag1, diag2, center])
+    directional = 0.0
+    for kernel in kernels:
+        directional = directional + F.conv2d(seeds, kernel / kernel.sum().clamp_min(eps), padding=kernel_size // 2)
+    directional = min_max_normalize(directional / float(len(kernels)), eps=eps)
+    suppression = min(1.0, max(0.0, float(strength))) * directional
+    return (base_mask * (1.0 - suppression)).clamp(0.01, 1.0)
+
+
 def low_rank_background_loss(background_img, rank_fraction=0.15, eps=1e-8):
     _, channels, height, width = background_img.shape
     matrix = background_img.squeeze(0).reshape(channels, height * width)
@@ -925,6 +965,40 @@ def compute_highfreq_score(residual_score, mode="none", wavelet="haar", level=1)
     raise ValueError(f"Unknown high-frequency score mode: {mode}")
 
 
+def compute_superpixel_region_prior(
+    residual_score,
+    contrast_score,
+    uncertainty_score,
+    highfreq_score=None,
+    labels_tensor=None,
+    residual_weight=0.45,
+    contrast_weight=0.25,
+    uncertainty_weight=0.15,
+    highfreq_weight=0.15,
+    eps=1e-8,
+):
+    if labels_tensor is None:
+        return None
+    labels = labels_tensor.view(-1).long()
+    label_count = int(labels.max().item()) + 1
+    score_terms = [
+        float(residual_weight) * rank_normalize_score(residual_score, eps=eps),
+        float(contrast_weight) * rank_normalize_score(contrast_score, eps=eps),
+        float(uncertainty_weight) * rank_normalize_score(uncertainty_score, eps=eps),
+    ]
+    if highfreq_score is not None and float(highfreq_weight) > 0.0:
+        score_terms.append(float(highfreq_weight) * rank_normalize_score(highfreq_score, eps=eps))
+    pixel_score = min_max_normalize(sum(score_terms), eps=eps)
+    flat = pixel_score.view(-1)
+    sums = torch.zeros(label_count, device=pixel_score.device, dtype=pixel_score.dtype)
+    counts = torch.zeros(label_count, device=pixel_score.device, dtype=pixel_score.dtype)
+    sums.scatter_add_(0, labels, flat)
+    counts.scatter_add_(0, labels, torch.ones_like(flat))
+    means = sums / counts.clamp_min(eps)
+    region_score = means[labels].view_as(pixel_score)
+    return min_max_normalize(region_score, eps=eps)
+
+
 def compute_highfreq_adaptive_alpha(
     base_score,
     highfreq_score,
@@ -1249,6 +1323,9 @@ def compute_final_artifacts(
     highfreq_edge_guard=False,
     highfreq_edge_guard_quantile=0.85,
     highfreq_edge_guard_strength=0.75,
+    region_prior_enabled=False,
+    region_prior_weight=0.15,
+    region_prior_labels=None,
 ):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
@@ -1271,6 +1348,13 @@ def compute_final_artifacts(
             weights=weights,
             adaptive=adaptive_score_fusion,
         )
+        region_prior_score = compute_superpixel_region_prior(
+            residual_score,
+            contrast_score,
+            uncertainty_score,
+            highfreq_score=highfreq_score,
+            labels_tensor=region_prior_labels,
+        ) if region_prior_enabled else None
         fused_score, highfreq_alpha, highfreq_alpha_map, highfreq_diagnostics = fuse_with_highfreq_score(
             fused_score,
             highfreq_score,
@@ -1303,10 +1387,15 @@ def compute_final_artifacts(
             edge_guard_quantile=highfreq_edge_guard_quantile,
             edge_guard_strength=highfreq_edge_guard_strength,
         )
+        if region_prior_score is not None and float(region_prior_weight) > 0.0:
+            alpha = min(1.0, max(0.0, float(region_prior_weight)))
+            fused_score = min_max_normalize((1.0 - alpha) * fused_score + alpha * region_prior_score)
+            highfreq_diagnostics["region_prior_alpha"] = float(alpha)
 
     highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
     highfreq_alpha_np = None if highfreq_alpha is None else np.asarray([highfreq_alpha], dtype=np.float32)
     highfreq_alpha_map_np = None if highfreq_alpha_map is None else highfreq_alpha_map.detach().cpu().squeeze().numpy()
+    region_prior_np = None if region_prior_score is None else region_prior_score.detach().cpu().squeeze().numpy()
     return {
         "background_img": out_h.detach().cpu().squeeze(0).numpy(),
         "residual_score": residual_score.detach().cpu().squeeze().numpy(),
@@ -1315,14 +1404,41 @@ def compute_final_artifacts(
         "highfreq_score": highfreq_score_np,
         "highfreq_alpha": highfreq_alpha_np,
         "highfreq_alpha_map": highfreq_alpha_map_np,
+        "region_prior_score": region_prior_np,
         "highfreq_diagnostics": highfreq_diagnostics,
         "fused_score": fused_score.detach().cpu().squeeze().numpy(),
         "mask": mask_var.detach().cpu().squeeze().numpy(),
     }
 
 
+class ErrorAdaptiveReconstructionConv(torch.nn.Module):
+    def __init__(self, channels, strength=0.15):
+        super(ErrorAdaptiveReconstructionConv, self).__init__()
+        self.strength = float(strength)
+        hidden = max(16, min(64, channels // 2))
+        self.correction = torch.nn.Sequential(
+            torch.nn.Conv2d(channels * 4, hidden, kernel_size=3, padding=1, bias=True),
+            torch.nn.LeakyReLU(0.2, inplace=True),
+            torch.nn.Conv2d(hidden, channels, kernel_size=3, padding=1, bias=True),
+        )
+
+    def forward(self, reconstruction, anomaly_prior=None):
+        if anomaly_prior is None or self.strength <= 0.0:
+            return reconstruction
+        if anomaly_prior.shape[-2:] != reconstruction.shape[-2:]:
+            anomaly_prior = F.interpolate(anomaly_prior, size=reconstruction.shape[-2:], mode="bilinear", align_corners=False)
+        anomaly_prior = anomaly_prior.clamp(0.0, 1.0).detach()
+        local_background = F.avg_pool2d(reconstruction, kernel_size=5, stride=1, padding=2)
+        delta = reconstruction - local_background
+        prior_channels = anomaly_prior.expand(-1, reconstruction.shape[1], -1, -1)
+        correction = self.correction(torch.cat([reconstruction, local_background, delta, prior_channels], dim=1))
+        adaptive_background = local_background + correction
+        mix = (self.strength * anomaly_prior).clamp(0.0, 1.0)
+        return (1.0 - mix) * reconstruction + mix * adaptive_background
+
+
 class DPMN(torch.nn.Module):
-    def __init__(self, input_depth, rmax, band, e_torch, pad):
+    def __init__(self, input_depth, rmax, band, e_torch, pad, use_error_adaptive_conv=False, error_adaptive_strength=0.15):
         super(DPMN, self).__init__()
         self.input_depth = input_depth
         self.band = band
@@ -1350,6 +1466,8 @@ class DPMN(torch.nn.Module):
         self.fc1 = torch.nn.Linear(input_depth, band)
         self.fc1.weight.data = e_torch.clone()
         self.conv = torch.nn.Conv2d(in_channels=band, out_channels=band, kernel_size=3, stride=1, padding=1)
+        self.use_error_adaptive_conv = bool(use_error_adaptive_conv)
+        self.error_adaptive_conv = ErrorAdaptiveReconstructionConv(band, strength=error_adaptive_strength)
 
     def forward(self, x, enhancement_prior=None):
         x = self.conv1(x)
@@ -1367,6 +1485,8 @@ class DPMN(torch.nn.Module):
         out_h = out_h.view(1, self.band, row, col)
         out = out.view(1, rmax, row, col)
         out_h = self.conv(out_h)
+        if self.use_error_adaptive_conv:
+            out_h = self.error_adaptive_conv(out_h, anomaly_prior=enhancement_prior)
         return out, out_h
 
 
@@ -1455,6 +1575,14 @@ def run_single_sample(
     edge_training_guard_quantile = float(mode_config.get("edge_training_guard_quantile", 0.85))
     edge_training_guard_strength = float(mode_config.get("edge_training_guard_strength", 0.5))
     edge_training_guard_base_quantile = float(mode_config.get("edge_training_guard_base_quantile", 0.85))
+    use_error_adaptive_conv = bool(mode_config.get("error_adaptive_conv", False))
+    error_adaptive_strength = float(mode_config.get("error_adaptive_strength", 0.15))
+    use_multidir_suppression = bool(mode_config.get("multidir_suppression", False))
+    multidir_suppression_quantile = float(mode_config.get("multidir_suppression_quantile", 0.88))
+    multidir_suppression_strength = float(mode_config.get("multidir_suppression_strength", 0.55))
+    multidir_suppression_kernel = int(mode_config.get("multidir_suppression_kernel", 7))
+    use_region_prior = bool(mode_config.get("region_prior", False))
+    region_prior_weight = float(mode_config.get("region_prior_weight", 0.15))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1501,7 +1629,15 @@ def run_single_sample(
     col = img_size[2]
     input_depth = rmax
 
-    net = DPMN(input_depth=input_depth, rmax=rmax, band=band, e_torch=e_torch, pad=pad)
+    net = DPMN(
+        input_depth=input_depth,
+        rmax=rmax,
+        band=band,
+        e_torch=e_torch,
+        pad=pad,
+        use_error_adaptive_conv=use_error_adaptive_conv,
+        error_adaptive_strength=error_adaptive_strength,
+    )
     torch.nn.init.normal_(net.conv.weight, mean=0, std=0.01)
     net_input = get_noise(input_depth, method, img_np.shape[1:], noise_type="u").type(dtype)
     net.cuda()
@@ -1585,6 +1721,16 @@ def run_single_sample(
         current_sam_weight = get_sam_weight(iter_num)
         loss_mask = mask_var_clone
         blindspot_active = 0.0
+        multidir_active = 0.0
+        if use_multidir_suppression and iter_num >= warmup_iters:
+            loss_mask = make_multidirectional_suppression_weight(
+                loss_mask,
+                residual_var_clone,
+                quantile=multidir_suppression_quantile,
+                strength=multidir_suppression_strength,
+                kernel_size=multidir_suppression_kernel,
+            )
+            multidir_active = 1.0
         if use_blindspot and iter_num >= warmup_iters:
             loss_mask = make_blindspot_weight(mask_var_clone, blindspot_ratio, guard_window)
             blindspot_active = 1.0
@@ -1618,6 +1764,7 @@ def run_single_sample(
         metrics["total_loss"] = float(total_loss.item())
         metrics["sam_weight"] = float(current_sam_weight)
         metrics["blindspot_active"] = float(blindspot_active)
+        metrics["multidir_active"] = float(multidir_active)
         return mask_var_clone, residual_var_clone, total_loss, metrics
 
     p = get_params(opt_over, net, net_input)
@@ -1646,7 +1793,8 @@ def run_single_sample(
                 f"sam_w: {metrics['sam_weight']:.6f}; "
                 f"lr: {metrics.get('low_rank_loss', 0.0):.6f}; "
                 f"sp: {metrics.get('sparse_loss', 0.0):.6f}; "
-                f"bs: {metrics.get('blindspot_active', 0.0):.0f}"
+                f"bs: {metrics.get('blindspot_active', 0.0):.0f}; "
+                f"md: {metrics.get('multidir_active', 0.0):.0f}"
             )
 
         loss_last = total_loss.item()
@@ -1686,6 +1834,9 @@ def run_single_sample(
                 highfreq_edge_guard=highfreq_edge_guard,
                 highfreq_edge_guard_quantile=highfreq_edge_guard_quantile,
                 highfreq_edge_guard_strength=highfreq_edge_guard_strength,
+                region_prior_enabled=use_region_prior,
+                region_prior_weight=region_prior_weight,
+                region_prior_labels=sp_labels_var,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1706,6 +1857,7 @@ def run_single_sample(
                     "highfreq_score": final_artifacts["highfreq_score"],
                     "highfreq_alpha": final_artifacts["highfreq_alpha"],
                     "highfreq_alpha_map": final_artifacts["highfreq_alpha_map"],
+                    "region_prior_score": final_artifacts["region_prior_score"],
                     "fused_score": final_artifacts["fused_score"],
                 },
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
@@ -1973,6 +2125,51 @@ def parse_args():
         help="Anomaly-rank threshold below which edge pixels are treated as weak-evidence background.",
     )
     parser.add_argument(
+        "--error-adaptive-conv",
+        action="store_true",
+        help="Enable reconstruction-side error-adaptive convolution guided by anomaly prior.",
+    )
+    parser.add_argument(
+        "--error-adaptive-strength",
+        type=float,
+        default=0.15,
+        help="Blend strength for error-adaptive reconstruction convolution.",
+    )
+    parser.add_argument(
+        "--multidir-suppression",
+        action="store_true",
+        help="Use multi-directional anomaly-suppression masks during training after warmup.",
+    )
+    parser.add_argument(
+        "--multidir-suppression-quantile",
+        type=float,
+        default=0.88,
+        help="Anomaly-rank threshold for multi-directional suppression seeds.",
+    )
+    parser.add_argument(
+        "--multidir-suppression-strength",
+        type=float,
+        default=0.55,
+        help="Strength of multi-directional training suppression.",
+    )
+    parser.add_argument(
+        "--multidir-suppression-kernel",
+        type=int,
+        default=7,
+        help="Line/center kernel size for multi-directional suppression.",
+    )
+    parser.add_argument(
+        "--region-prior",
+        action="store_true",
+        help="Fuse a superpixel-region spectral attribute prior into the final anomaly score.",
+    )
+    parser.add_argument(
+        "--region-prior-weight",
+        type=float,
+        default=0.15,
+        help="Final-score fusion weight for the superpixel-region prior.",
+    )
+    parser.add_argument(
         "--highfreq-wavelet",
         default="haar",
         help="PyWavelets wavelet name used when --highfreq-score-mode pywt is selected.",
@@ -2213,6 +2410,14 @@ def main():
     mode_config["edge_training_guard_quantile"] = min(1.0, max(0.0, float(args.edge_training_guard_quantile)))
     mode_config["edge_training_guard_strength"] = min(1.0, max(0.0, float(args.edge_training_guard_strength)))
     mode_config["edge_training_guard_base_quantile"] = min(1.0, max(0.0, float(args.edge_training_guard_base_quantile)))
+    mode_config["error_adaptive_conv"] = bool(args.error_adaptive_conv)
+    mode_config["error_adaptive_strength"] = min(1.0, max(0.0, float(args.error_adaptive_strength)))
+    mode_config["multidir_suppression"] = bool(args.multidir_suppression)
+    mode_config["multidir_suppression_quantile"] = min(1.0, max(0.0, float(args.multidir_suppression_quantile)))
+    mode_config["multidir_suppression_strength"] = min(1.0, max(0.0, float(args.multidir_suppression_strength)))
+    mode_config["multidir_suppression_kernel"] = max(3, int(args.multidir_suppression_kernel))
+    mode_config["region_prior"] = bool(args.region_prior)
+    mode_config["region_prior_weight"] = min(1.0, max(0.0, float(args.region_prior_weight)))
     mode_config["highfreq_wavelet"] = args.highfreq_wavelet
     mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)
