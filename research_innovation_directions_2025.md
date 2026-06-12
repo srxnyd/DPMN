@@ -3029,3 +3029,96 @@ recommended experiment setting.
 EAC and region prior remain excluded from the main path.
 ```
 
+## 2026-06-13: conversation and execution log
+
+User direction:
+
+```text
+Continue the ablation after the accidental interruption.
+Decide which of the three proposed parts should be kept.
+Then run the recommended MD-only full 15-sample experiment and upload the current code to GitHub.
+Finally, write the process and conversation into this markdown file.
+```
+
+Work sequence:
+
+```text
+1. Recovered the interrupted EAC-only ablation from the existing result directory.
+   Result: EAC-only targeted mean AUC = 0.919350421646.
+   This was below the targeted stationary-Haar diagnostic baseline mean AUC = 0.922560467721.
+
+2. Ran MD-only targeted ablation on:
+   3, abu_beach_2, abu_airport_1, abu_airport_2, abu_beach_3.
+   Result: MD-only targeted mean AUC = 0.926733643516.
+   This was the only targeted ablation that exceeded the baseline.
+
+3. Ran region-prior-only targeted ablation.
+   Result: region-prior-only targeted mean AUC = 0.883080308523.
+   Failure cases included abu_beach_2 = 0.725242472196 and abu_beach_3 = 0.931388163343.
+   Decision: current region/superpixel pooled prior is not stable enough and is not a true ACMamba-style branch.
+
+4. Ran EAC + MD targeted ablation to check interaction.
+   Result: EAC + MD targeted mean AUC = 0.917931636484.
+   This was below both baseline and MD-only, so EAC was excluded from the main path.
+
+5. Decided to keep only multi-directional anomaly-suppression masking as the next candidate.
+   EAC and region prior remain default-off diagnostics, not main components.
+
+6. Ran MD-only full 15-sample experiment.
+   Result: full mean AUC = 0.958119941153.
+   This exceeded the previously recorded stationary-Haar full mean AUC = 0.956469872526.
+
+7. Verified train.py syntax with:
+   python -m py_compile train.py
+
+8. Committed and pushed the code/research record to GitHub.
+   commit: 1d83ff6 Add multidirectional suppression ablation
+   remote: origin/main
+   push result: 157d7d5..1d83ff6 main -> main
+```
+
+Final retained setting:
+
+```text
+python -u train.py \
+  --ablation-mode sp_imp_dpmn \
+  --results-dir results_sp_imp_dpmn_md_only_full15 \
+  --multidir-suppression \
+  --multidir-suppression-strength 0.45 \
+  --multidir-suppression-quantile 0.88 \
+  --multidir-suppression-kernel 7 \
+  --highfreq-score-mode stationary_haar \
+  --highfreq-fusion-mode diagnostic \
+  --highfreq-diagnostic-fixed-alpha 0.3 \
+  --highfreq-diagnostic-soft-low-alpha 0.10 \
+  --highfreq-diagnostic-soft-high-alpha 0.30 \
+  --highfreq-soft-map-top-quantile 0.85
+```
+
+Implementation status:
+
+```text
+train.py now contains default-off switches for:
+  --error-adaptive-conv
+  --multidir-suppression
+  --region-prior
+
+Only --multidir-suppression is supported by the current ablation evidence.
+The other two switches should not be used for full experiments unless redesigned.
+```
+
+Decision summary:
+
+```text
+Keep:
+  multi-directional anomaly-suppression masking
+
+Do not keep as main components:
+  error-adaptive convolution
+  current region/superpixel prior branch
+
+Next reasonable paper-facing direction:
+  report MD suppression as the validated training-side suppression component,
+  keep EAC and region prior as negative ablation evidence or future-work notes.
+```
+
