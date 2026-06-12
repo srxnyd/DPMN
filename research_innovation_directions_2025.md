@@ -2039,3 +2039,167 @@ After the `abu_beach_2` sweep:
 - If multiple protected-branch settings remain unstable or still focus on shoreline edges, then the error is likely already created during reconstruction/training rather than only final fusion.
 - In that case, the next training-side change should be controlled anti-identity / error-adaptive training, not a broad AGM/DPMN rewrite.
 
+### Execution update: abu_beach_2 protected-branch robustness sweep
+
+Date: 2026-06-12.
+
+The requested small protected-branch robustness sweep for `abu_beach_2` was completed with `top_quantile=0.85` and two repeats per setting.
+
+Sweep command pattern:
+
+```bash
+python -u train.py   --ablation-mode sp_imp_dpmn   --sample-ids abu_beach_2   --highfreq-score-mode stationary_haar   --highfreq-fusion-mode diagnostic   --highfreq-diagnostic-fixed-alpha 0.3   --highfreq-diagnostic-soft-low-alpha LOW   --highfreq-diagnostic-soft-high-alpha HIGH   --highfreq-soft-map-top-quantile 0.85
+```
+
+Summary file:
+
+```text
+results_sp_imp_dpmn_diagnostic_v3_beach2_sweep_summary.csv
+```
+
+Results:
+
+```text
+soft_low,soft_high,repeat,auc
+0.05,0.40,r1,0.817889688540
+0.05,0.40,r2,0.836353246470
+0.08,0.30,r1,0.840708045085
+0.08,0.30,r2,0.833709748807
+0.10,0.30,r1,0.835135075051
+0.10,0.30,r2,0.867841790303
+```
+
+Group summaries:
+
+```text
+0.05,0.40 mean=0.827121467505 min=0.817889688540 max=0.836353246470
+0.08,0.30 mean=0.837208896946 min=0.833709748807 max=0.840708045085
+0.10,0.30 mean=0.851488432677 min=0.835135075051 max=0.867841790303
+```
+
+Interpretation with user visual diagnosis:
+
+The user observed that `abu_beach_2` heatmap highlights beach/shoreline edges rather than the airplane. The sweep confirms this is not solved reliably by final score alpha tuning. Even when the protected soft-map branch is selected, most settings stay below `0.86`, and the one successful repeat `(0.10,0.30,r2)` is not stable across repeats.
+
+Conclusion:
+
+`abu_beach_2` is now evidence that final fusion is not enough. The model/optimization is already producing a score field where shoreline edges dominate the aircraft. Continuing to tune `soft_low/high` is unlikely to be the best use of time.
+
+Next recommended optimization:
+
+Move one step earlier than final score fusion, but still avoid a broad AGM/DPMN rewrite.
+
+Recommended controlled training-side change:
+
+```text
+Edge-aware background suppression / anti-edge training guard for protected beach scenes.
+```
+
+Candidate implementation direction:
+
+1. During training or final scoring, compute an image-edge/texture map from the input intensity or first principal component.
+2. Identify broad background edges where `edge_score` is high but base anomaly evidence is weak.
+3. Suppress high-frequency anomaly contribution in those regions, or downweight them in the adaptive mask/background-mining step.
+4. Keep compact base+HF agreement regions so aircraft-like targets are not removed.
+
+A simple score-side version can be tested first:
+
+```text
+edge_map = Sobel/PCA edge response from input HSI intensity
+edge_guard = high where edge_map is high and base_score is not top-ranked
+alpha_map = alpha_map * (1 - edge_guard)
+final = normalize((1-alpha_map)*base + alpha_map*hf)
+```
+
+If this still fails visually on `abu_beach_2`, then move to training-side anti-identity/error-adaptive logic. That is the point where AGM/DPMN-adjacent changes become justified, but the first change should be a controlled guard module, not a broad backbone rewrite.
+
+For `abu_urban_4`, the user observed that AUC is high but some expected anomaly regions are not bright. This reinforces that the next evaluation should include localization metrics and top-k/connected-component checks, not only ROC-AUC. AUC can remain high while visually important anomaly regions are under-emphasized.
+
+### Execution update: beach_2 edge-focused score-side check
+
+Date: 2026-06-12.
+
+After the user noted that `abu_beach_2` heatmap mainly highlights beach/shoreline edges instead of the airplane, an explicit score-side edge guard was implemented in `train.py`.
+
+New optional CLI:
+
+```bash
+--highfreq-edge-guard
+--highfreq-edge-guard-quantile 0.85
+--highfreq-edge-guard-strength 0.75
+```
+
+Method:
+
+```text
+edge_score = Sobel edge response from mean HSI intensity
+edge_guard = high where input edge is high and base_score is weak
+alpha_map = alpha_map * (1 - edge_guard_strength * edge_guard)
+```
+
+The guard is disabled by default, so previous diagnostic v2/v3 behavior is unchanged unless explicitly enabled.
+
+The requested `abu_beach_2` protected-branch robustness sweep was also completed:
+
+```text
+results_sp_imp_dpmn_diagnostic_v3_beach2_sweep_summary.csv
+
+soft_low,soft_high,repeat,auc
+0.05,0.40,r1,0.817889688540
+0.05,0.40,r2,0.836353246470
+0.08,0.30,r1,0.840708045085
+0.08,0.30,r2,0.833709748807
+0.10,0.30,r1,0.835135075051
+0.10,0.30,r2,0.867841790303
+```
+
+Group means:
+
+```text
+0.05,0.40 mean=0.827121467505
+0.08,0.30 mean=0.837208896946
+0.10,0.30 mean=0.851488432677
+```
+
+Only one repeat reached `0.86+`. The result is not stable.
+
+Edge guard validation command:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_diagnostic_v3_edge_guard_beach2_check --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --highfreq-edge-guard --highfreq-edge-guard-quantile 0.85 --highfreq-edge-guard-strength 0.75
+```
+
+Result:
+
+```text
+abu_beach_2 edge_guard: 0.809476171132
+selected: soft_map
+edge_guard_mean: 0.073454
+alpha_mean: 0.111013
+```
+
+Conclusion:
+
+The edge-focused score-side guard did not solve `abu_beach_2`. Combined with the user's visual observation, the failure is likely not only final fusion. The model/training is already producing a representation where shoreline edges dominate the aircraft target.
+
+For `abu_urban_4`, AUC is high but some visually expected anomaly regions are not bright. This indicates the method can rank enough positives well for ROC-AUC while still under-covering connected anomaly regions. Future evaluation should include localization/coverage metrics in addition to AUC.
+
+Next recommended optimization:
+
+Move from final score-side fusion to a controlled training-side change, but still do not broadly rewrite AGM/DPMN.
+
+Most appropriate next change:
+
+```text
+Edge-aware anti-identity / background-mining guard for beach-like samples.
+```
+
+Concrete direction:
+
+1. Compute input edge map from mean HSI intensity or PCA-1.
+2. During adaptive mask/background mining, avoid treating broad high-edge shoreline pixels as anomaly candidates unless base residual and spectral evidence also agree.
+3. Add a weak penalty or mask downweight so the model learns shoreline/texture as background rather than letting those edges dominate the anomaly score.
+4. Keep compact base+HF agreement regions to preserve aircraft-like targets.
+
+This is an AGM/DPMN-adjacent training-side intervention, but not a broad backbone rewrite. It is justified now because multiple score-side protected-branch attempts failed to stabilize `abu_beach_2`.
+

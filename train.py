@@ -945,6 +945,24 @@ def compute_highfreq_adaptive_alpha(
     return float(alpha), diagnostics
 
 
+def compute_input_edge_score(target_img, eps=1e-8):
+    intensity = target_img.mean(dim=1, keepdim=True)
+    sobel_x = torch.tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+        device=target_img.device,
+        dtype=target_img.dtype,
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+        device=target_img.device,
+        dtype=target_img.dtype,
+    ).view(1, 1, 3, 3)
+    grad_x = F.conv2d(intensity, sobel_x, padding=1)
+    grad_y = F.conv2d(intensity, sobel_y, padding=1)
+    edge_score = torch.sqrt((grad_x * grad_x + grad_y * grad_y).clamp_min(eps))
+    return min_max_normalize(edge_score, eps=eps)
+
+
 def compute_highfreq_soft_alpha_map(
     base_score,
     highfreq_score,
@@ -953,6 +971,10 @@ def compute_highfreq_soft_alpha_map(
     top_quantile=0.85,
     gate_slope=16.0,
     diffuse_guard=0.5,
+    edge_score=None,
+    edge_guard_enabled=False,
+    edge_guard_quantile=0.85,
+    edge_guard_strength=0.75,
     **adaptive_kwargs,
 ):
     _, diagnostics = compute_highfreq_adaptive_alpha(
@@ -972,6 +994,14 @@ def compute_highfreq_soft_alpha_map(
     guard_factor = 1.0 if diagnostics["use_high_alpha"] > 0.5 else float(diffuse_guard)
     alpha_map = low_alpha + (high_alpha - low_alpha) * agreement_map * guard_factor
     alpha_map = alpha_map * (1.0 - hf_without_base) + low_alpha * hf_without_base
+    if edge_guard_enabled and edge_score is not None:
+        edge_rank = rank_normalize_score(edge_score)
+        edge_high = torch.sigmoid((edge_rank - edge_guard_quantile) * gate_slope)
+        base_weak = torch.sigmoid((top_quantile - base_rank) * gate_slope)
+        edge_guard = edge_high * base_weak
+        alpha_map = alpha_map * (1.0 - float(edge_guard_strength) * edge_guard.clamp(0.0, 1.0))
+        diagnostics["edge_guard_mean"] = float(edge_guard.mean().item())
+        diagnostics["edge_guard_max"] = float(edge_guard.max().item())
     alpha_map = alpha_map.clamp(min=min(low_alpha, high_alpha), max=max(low_alpha, high_alpha))
     diagnostics["alpha_mean"] = float(alpha_map.mean().item())
     diagnostics["alpha_max"] = float(alpha_map.max().item())
@@ -1002,6 +1032,10 @@ def fuse_with_highfreq_score(
     diagnostic_fixed_alpha=None,
     diagnostic_soft_low_alpha=None,
     diagnostic_soft_high_alpha=None,
+    edge_score=None,
+    edge_guard_enabled=False,
+    edge_guard_quantile=0.85,
+    edge_guard_strength=0.75,
 ):
     if highfreq_score is None:
         return base_score, None, None, {}
@@ -1027,6 +1061,10 @@ def fuse_with_highfreq_score(
             top_quantile=soft_map_top_quantile,
             gate_slope=soft_map_gate_slope,
             diffuse_guard=soft_map_diffuse_guard,
+            edge_score=edge_score,
+            edge_guard_enabled=edge_guard_enabled,
+            edge_guard_quantile=edge_guard_quantile,
+            edge_guard_strength=edge_guard_strength,
             top_overlap_threshold=adaptive_top_overlap_threshold,
             rank_corr_threshold=adaptive_rank_corr_threshold,
             min_top_concentration=adaptive_min_top_concentration,
@@ -1075,6 +1113,10 @@ def fuse_with_highfreq_score(
                 top_quantile=soft_map_top_quantile,
                 gate_slope=soft_map_gate_slope,
                 diffuse_guard=soft_map_diffuse_guard,
+                edge_score=edge_score,
+                edge_guard_enabled=edge_guard_enabled,
+                edge_guard_quantile=edge_guard_quantile,
+                edge_guard_strength=edge_guard_strength,
                 top_overlap_threshold=adaptive_top_overlap_threshold,
                 rank_corr_threshold=adaptive_rank_corr_threshold,
                 min_top_concentration=adaptive_min_top_concentration,
@@ -1184,6 +1226,9 @@ def compute_final_artifacts(
     highfreq_diagnostic_soft_low_alpha=None,
     highfreq_diagnostic_soft_high_alpha=None,
     raw_input_dynamic_range=None,
+    highfreq_edge_guard=False,
+    highfreq_edge_guard_quantile=0.85,
+    highfreq_edge_guard_strength=0.75,
 ):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
@@ -1198,6 +1243,7 @@ def compute_final_artifacts(
             wavelet=highfreq_wavelet,
             level=highfreq_level,
         )
+        edge_score = compute_input_edge_score(img_var) if highfreq_edge_guard else None
         fused_score = fuse_detection_scores(
             residual_score,
             contrast_score,
@@ -1232,6 +1278,10 @@ def compute_final_artifacts(
             diagnostic_fixed_alpha=highfreq_diagnostic_fixed_alpha,
             diagnostic_soft_low_alpha=highfreq_diagnostic_soft_low_alpha,
             diagnostic_soft_high_alpha=highfreq_diagnostic_soft_high_alpha,
+            edge_score=edge_score,
+            edge_guard_enabled=highfreq_edge_guard,
+            edge_guard_quantile=highfreq_edge_guard_quantile,
+            edge_guard_strength=highfreq_edge_guard_strength,
         )
 
     highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
@@ -1378,6 +1428,9 @@ def run_single_sample(
     highfreq_diagnostic_fixed_alpha = mode_config.get("highfreq_diagnostic_fixed_alpha", None)
     highfreq_diagnostic_soft_low_alpha = mode_config.get("highfreq_diagnostic_soft_low_alpha", None)
     highfreq_diagnostic_soft_high_alpha = mode_config.get("highfreq_diagnostic_soft_high_alpha", None)
+    highfreq_edge_guard = bool(mode_config.get("highfreq_edge_guard", False))
+    highfreq_edge_guard_quantile = float(mode_config.get("highfreq_edge_guard_quantile", 0.85))
+    highfreq_edge_guard_strength = float(mode_config.get("highfreq_edge_guard_strength", 0.75))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1600,6 +1653,9 @@ def run_single_sample(
                 highfreq_diagnostic_soft_low_alpha=highfreq_diagnostic_soft_low_alpha,
                 highfreq_diagnostic_soft_high_alpha=highfreq_diagnostic_soft_high_alpha,
                 raw_input_dynamic_range=raw_input_dynamic_range,
+                highfreq_edge_guard=highfreq_edge_guard,
+                highfreq_edge_guard_quantile=highfreq_edge_guard_quantile,
+                highfreq_edge_guard_strength=highfreq_edge_guard_strength,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1672,6 +1728,7 @@ def run_single_sample(
                     f"selected: {diagnostics.get('selected_fusion', highfreq_fusion_mode)}; "
                     f"texture_guard: {diagnostics.get('concentrated_texture_guard', 0.0):.0f}; "
                     f"dyn_range: {diagnostics.get('input_dynamic_range', 0.0):.6f}; "
+                    f"edge_guard: {diagnostics.get('edge_guard_mean', 0.0):.6f}; "
                     f"alpha_min: {diagnostics.get('alpha_min', float(final_artifacts['highfreq_alpha'][0])):.6f}; "
                     f"alpha_max: {diagnostics.get('alpha_max', float(final_artifacts['highfreq_alpha'][0])):.6f}"
                 )
@@ -1844,6 +1901,23 @@ def parse_args():
         type=float,
         default=None,
         help="High alpha used by diagnostic fusion's protected soft-map branch. Defaults to highfreq adaptive high alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-edge-guard",
+        action="store_true",
+        help="Suppress high-frequency alpha on strong input edges where base anomaly evidence is weak.",
+    )
+    parser.add_argument(
+        "--highfreq-edge-guard-quantile",
+        type=float,
+        default=0.85,
+        help="Rank threshold for input edge regions used by high-frequency edge guard.",
+    )
+    parser.add_argument(
+        "--highfreq-edge-guard-strength",
+        type=float,
+        default=0.75,
+        help="Strength of high-frequency alpha suppression on guarded edge regions.",
     )
     parser.add_argument(
         "--highfreq-wavelet",
@@ -2079,6 +2153,9 @@ def main():
     mode_config["highfreq_diagnostic_soft_high_alpha"] = (
         None if args.highfreq_diagnostic_soft_high_alpha is None else min(1.0, max(0.0, float(args.highfreq_diagnostic_soft_high_alpha)))
     )
+    mode_config["highfreq_edge_guard"] = bool(args.highfreq_edge_guard)
+    mode_config["highfreq_edge_guard_quantile"] = min(1.0, max(0.0, float(args.highfreq_edge_guard_quantile)))
+    mode_config["highfreq_edge_guard_strength"] = min(1.0, max(0.0, float(args.highfreq_edge_guard_strength)))
     mode_config["highfreq_wavelet"] = args.highfreq_wavelet
     mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)
