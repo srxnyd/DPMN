@@ -2203,3 +2203,118 @@ Concrete direction:
 
 This is an AGM/DPMN-adjacent training-side intervention, but not a broad backbone rewrite. It is justified now because multiple score-side protected-branch attempts failed to stabilize `abu_beach_2`.
 
+### Decision: move from score-side alpha tuning to edge-aware training guard
+
+Date: 2026-06-12.
+
+Latest conclusion from the `abu_beach_2` visual diagnosis and sweep:
+
+```text
+The heatmap highlights beach/shoreline edges rather than the airplane.
+Protected soft-map alpha sweeps are not stable.
+Score-side edge guard also failed.
+```
+
+Therefore, the next optimization should move one step earlier than final score fusion. The target is still not a broad AGM/DPMN backbone rewrite. The next change should be a controlled training-side guard:
+
+```text
+Edge-aware anti-identity / background-mining guard
+```
+
+Goal:
+
+```text
+Make broad shoreline/texture edges behave like background during training or mask refinement,
+so they do not dominate the final anomaly score.
+```
+
+Implementation direction:
+
+1. Compute an input edge map from mean HSI intensity.
+2. During adaptive mask / online background mining, detect pixels where:
+
+```text
+edge_score is high
+base anomaly evidence is weak or not jointly supported
+```
+
+3. Increase background weight or reduce anomaly emphasis for these broad edge pixels.
+4. Keep compact pixels where base residual and high-frequency evidence agree, so airplane-like targets are not suppressed.
+
+This is an AGM/DPMN-adjacent training-side intervention, but still a controlled guard module. It should be tested first on `abu_beach_2` before any full rerun.
+
+
+
+### Execution update: conservative edge-aware training guard
+
+Date: 2026-06-12.
+
+Implemented a controlled training-side edge-aware background-mining guard in `train.py`.
+
+New CLI switches:
+
+```bash
+--edge-training-guard
+--edge-training-guard-quantile
+--edge-training-guard-strength
+--edge-training-guard-base-quantile
+```
+
+Mechanism:
+
+```text
+edge_score = Sobel edge response from mean HSI intensity
+anomaly_score = online background-mining anomaly evidence
+background_boost = high only where input edge is high and anomaly evidence is weak
+background_confidence = background_confidence + strength * background_boost * (1 - background_confidence)
+```
+
+The guard is disabled by default. It only affects online background mining when explicitly enabled.
+
+Two `abu_beach_2` controlled checks were run.
+
+Aggressive training guard:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_edge_training_guard_beach2_check --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --edge-training-guard --edge-training-guard-quantile 0.85 --edge-training-guard-strength 0.5 --edge-training-guard-base-quantile 0.85
+```
+
+Result:
+
+```text
+abu_beach_2 AUC: 0.797618831081
+```
+
+Conclusion: too aggressive. It likely suppresses useful target boundary evidence together with shoreline edges.
+
+Conservative training guard:
+
+```bash
+python -u train.py --ablation-mode sp_imp_dpmn --sample-ids abu_beach_2 --results-dir results_sp_imp_dpmn_edge_training_guard_beach2_conservative --highfreq-score-mode stationary_haar --highfreq-fusion-mode diagnostic --highfreq-diagnostic-fixed-alpha 0.3 --highfreq-diagnostic-soft-low-alpha 0.10 --highfreq-diagnostic-soft-high-alpha 0.30 --highfreq-soft-map-top-quantile 0.85 --edge-training-guard --edge-training-guard-quantile 0.90 --edge-training-guard-strength 0.2 --edge-training-guard-base-quantile 0.70
+```
+
+Result:
+
+```text
+abu_beach_2 AUC: 0.867262262050
+selected: soft_map
+alpha_mean: 0.107353
+hf_to_base_peak_ratio: 3.003680
+```
+
+Interpretation:
+
+The edge-aware training-side direction is useful only when very conservative. The result is close to the best single protected-branch sweep result (`0.867841790303`) and better than diagnostic v2 full-run `abu_beach_2` (`0.853102977169`). This supports the user's observation that shoreline edges are the failure mode, but also shows that broad edge suppression is dangerous.
+
+Next recommended optimization:
+
+1. Do not broadly change AGM/DPMN yet.
+2. Repeat the conservative training guard on `abu_beach_2` at least twice to test stability.
+3. If stable, run a full comparison with:
+
+```bash
+--edge-training-guard --edge-training-guard-quantile 0.90 --edge-training-guard-strength 0.2 --edge-training-guard-base-quantile 0.70
+```
+
+4. Add localization metrics for cases like `abu_urban_4`, because ROC-AUC can be high even when visually important connected anomaly regions are not bright enough.
+5. Only if conservative training guard is unstable or hurts full mean should AGM/DPMN-adjacent modules be considered. The first candidate should be anti-identity / error-adaptive training, not a broad AGM/DPMN backbone rewrite.

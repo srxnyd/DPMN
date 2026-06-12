@@ -436,6 +436,11 @@ def compute_online_background_mining_mask(
     warmup_progress,
     spatial_kernel=7,
     superpixel_labels=None,
+    edge_score=None,
+    edge_guard_enabled=False,
+    edge_guard_quantile=0.85,
+    edge_guard_strength=0.5,
+    edge_guard_base_quantile=0.85,
     eps=1e-8,
 ):
     residual_score = (recon_img - target_img).pow(2).sum(dim=1, keepdim=True)
@@ -465,6 +470,17 @@ def compute_online_background_mining_mask(
     anomaly_score = min_max_normalize(anomaly_score, eps=eps)
 
     background_confidence = (1.0 - anomaly_score).clamp(0.02, 1.0)
+    if edge_guard_enabled and edge_score is not None:
+        edge_rank = rank_normalize_score(edge_score, eps=eps)
+        anomaly_rank = rank_normalize_score(anomaly_score, eps=eps)
+        gate_slope = 16.0
+        edge_high = torch.sigmoid((edge_rank - float(edge_guard_quantile)) * gate_slope)
+        anomaly_weak = torch.sigmoid((float(edge_guard_base_quantile) - anomaly_rank) * gate_slope)
+        background_boost = (edge_high * anomaly_weak).clamp(0.0, 1.0)
+        boost_strength = min(1.0, max(0.0, float(edge_guard_strength)))
+        background_confidence = (
+            background_confidence + boost_strength * background_boost * (1.0 - background_confidence)
+        ).clamp(0.02, 1.0)
     background_confidence = smooth_mask_by_superpixel(background_confidence, superpixel_labels, eps=eps)
     quantile = 0.45 + 0.25 * warmup_progress
     threshold = torch.quantile(background_confidence.flatten(), quantile)
@@ -946,6 +962,10 @@ def compute_highfreq_adaptive_alpha(
 
 
 def compute_input_edge_score(target_img, eps=1e-8):
+    if target_img.dim() == 3:
+        target_img = target_img.unsqueeze(0)
+    if target_img.dim() != 4:
+        raise ValueError(f"Expected target_img with 3 or 4 dims, got shape {tuple(target_img.shape)}")
     intensity = target_img.mean(dim=1, keepdim=True)
     sobel_x = torch.tensor(
         [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
@@ -1431,6 +1451,10 @@ def run_single_sample(
     highfreq_edge_guard = bool(mode_config.get("highfreq_edge_guard", False))
     highfreq_edge_guard_quantile = float(mode_config.get("highfreq_edge_guard_quantile", 0.85))
     highfreq_edge_guard_strength = float(mode_config.get("highfreq_edge_guard_strength", 0.75))
+    edge_training_guard = bool(mode_config.get("edge_training_guard", False))
+    edge_training_guard_quantile = float(mode_config.get("edge_training_guard_quantile", 0.85))
+    edge_training_guard_strength = float(mode_config.get("edge_training_guard_strength", 0.5))
+    edge_training_guard_base_quantile = float(mode_config.get("edge_training_guard_base_quantile", 0.85))
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1467,6 +1491,7 @@ def run_single_sample(
 
     img_var = torch.from_numpy(img_np).type(dtype)
     train_target_var = torch.from_numpy(train_target_np).type(dtype)
+    training_edge_score = compute_input_edge_score(img_var).detach() if edge_training_guard else None
 
     img_size = img_var.size()
     e_size = e_torch.size()
@@ -1533,6 +1558,11 @@ def run_single_sample(
                     warmup_progress=warmup_progress,
                     spatial_kernel=spatial_kernel,
                     superpixel_labels=sp_labels_var,
+                    edge_score=training_edge_score,
+                    edge_guard_enabled=edge_training_guard,
+                    edge_guard_quantile=edge_training_guard_quantile,
+                    edge_guard_strength=edge_training_guard_strength,
+                    edge_guard_base_quantile=edge_training_guard_base_quantile,
                 )
             elif prior_mode == "consensus":
                 refined_mask, residual_img = compute_consensus_anomaly_prior(
@@ -1920,6 +1950,29 @@ def parse_args():
         help="Strength of high-frequency alpha suppression on guarded edge regions.",
     )
     parser.add_argument(
+        "--edge-training-guard",
+        action="store_true",
+        help="Boost background-mining confidence on strong input edges with weak anomaly evidence.",
+    )
+    parser.add_argument(
+        "--edge-training-guard-quantile",
+        type=float,
+        default=0.85,
+        help="Rank threshold for input edge regions used by training-side edge guard.",
+    )
+    parser.add_argument(
+        "--edge-training-guard-strength",
+        type=float,
+        default=0.5,
+        help="Strength of background-confidence boost on guarded edge regions.",
+    )
+    parser.add_argument(
+        "--edge-training-guard-base-quantile",
+        type=float,
+        default=0.85,
+        help="Anomaly-rank threshold below which edge pixels are treated as weak-evidence background.",
+    )
+    parser.add_argument(
         "--highfreq-wavelet",
         default="haar",
         help="PyWavelets wavelet name used when --highfreq-score-mode pywt is selected.",
@@ -2156,6 +2209,10 @@ def main():
     mode_config["highfreq_edge_guard"] = bool(args.highfreq_edge_guard)
     mode_config["highfreq_edge_guard_quantile"] = min(1.0, max(0.0, float(args.highfreq_edge_guard_quantile)))
     mode_config["highfreq_edge_guard_strength"] = min(1.0, max(0.0, float(args.highfreq_edge_guard_strength)))
+    mode_config["edge_training_guard"] = bool(args.edge_training_guard)
+    mode_config["edge_training_guard_quantile"] = min(1.0, max(0.0, float(args.edge_training_guard_quantile)))
+    mode_config["edge_training_guard_strength"] = min(1.0, max(0.0, float(args.edge_training_guard_strength)))
+    mode_config["edge_training_guard_base_quantile"] = min(1.0, max(0.0, float(args.edge_training_guard_base_quantile)))
     mode_config["highfreq_wavelet"] = args.highfreq_wavelet
     mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)
