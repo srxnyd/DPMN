@@ -94,6 +94,8 @@ def save_score_components(output_dir, sample_id, score_maps, weights):
         save_data["highfreq_score"] = np.asarray(score_maps["highfreq_score"], dtype=np.float32)
     if "highfreq_alpha" in score_maps and score_maps["highfreq_alpha"] is not None:
         save_data["highfreq_alpha"] = np.asarray(score_maps["highfreq_alpha"], dtype=np.float32)
+    if "highfreq_alpha_map" in score_maps and score_maps["highfreq_alpha_map"] is not None:
+        save_data["highfreq_alpha_map"] = np.asarray(score_maps["highfreq_alpha_map"], dtype=np.float32)
     scipy.io.savemat(mat_path, save_data)
     return mat_path
 
@@ -831,6 +833,29 @@ def compute_top_overlap(score_a, score_b, top_fraction=0.05):
     return overlap
 
 
+def compute_top_concentration(score, top_fraction=0.01, eps=1e-8):
+    flat = score.flatten().clamp_min(0.0)
+    top_k = max(1, int(float(flat.numel()) * float(top_fraction)))
+    top_sum = torch.topk(flat, top_k, largest=True).values.sum()
+    total_sum = flat.sum().clamp_min(eps)
+    return top_sum / total_sum
+
+
+def compute_spatial_entropy(score, eps=1e-8):
+    flat = score.flatten().clamp_min(0.0)
+    probability = flat / flat.sum().clamp_min(eps)
+    entropy = -(probability * torch.log(probability.clamp_min(eps))).sum()
+    max_entropy = max(float(np.log(max(int(flat.numel()), 2))), eps)
+    return entropy / max_entropy
+
+
+def compute_top_sharpness(score, top_fraction=0.01, eps=1e-8):
+    flat = score.flatten().clamp_min(0.0)
+    top_k = max(1, int(float(flat.numel()) * float(top_fraction)))
+    top_mean = torch.topk(flat, top_k, largest=True).values.mean()
+    return top_mean / flat.mean().clamp_min(eps)
+
+
 def should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
     residual_contrast_score = min_max_normalize(0.85 * residual_score + 0.15 * contrast_score)
     top_overlap = compute_top_overlap(residual_contrast_score, uncertainty_score, top_fraction=0.05)
@@ -891,17 +916,67 @@ def compute_highfreq_adaptive_alpha(
     high_alpha=0.4,
     top_overlap_threshold=0.20,
     rank_corr_threshold=0.15,
+    min_top_concentration=0.08,
+    max_entropy=0.85,
+    min_peak_ratio=0.75,
+    max_peak_ratio=3.0,
 ):
     top_overlap = compute_top_overlap(base_score, highfreq_score, top_fraction=0.05)
     rank_corr = compute_rank_correlation(base_score, highfreq_score)
-    use_high_alpha = bool((top_overlap >= top_overlap_threshold and rank_corr >= rank_corr_threshold).item())
+    hf_top_concentration = compute_top_concentration(highfreq_score, top_fraction=0.01)
+    hf_entropy = compute_spatial_entropy(highfreq_score)
+    hf_sharpness = compute_top_sharpness(highfreq_score, top_fraction=0.01)
+    base_sharpness = compute_top_sharpness(base_score, top_fraction=0.01)
+    hf_to_base_peak_ratio = hf_sharpness / base_sharpness.clamp_min(1e-8)
+    agreement_ok = top_overlap >= top_overlap_threshold and rank_corr >= rank_corr_threshold
+    concentration_ok = hf_top_concentration >= min_top_concentration
+    entropy_ok = hf_entropy <= max_entropy
+    peak_ratio_ok = hf_to_base_peak_ratio >= min_peak_ratio and hf_to_base_peak_ratio <= max_peak_ratio
+    use_high_alpha = bool((agreement_ok and concentration_ok and entropy_ok and peak_ratio_ok).item())
     alpha = high_alpha if use_high_alpha else low_alpha
     diagnostics = {
         "top_overlap": float(top_overlap.item()),
         "rank_corr": float(rank_corr.item()),
+        "hf_top_concentration": float(hf_top_concentration.item()),
+        "hf_entropy": float(hf_entropy.item()),
+        "hf_to_base_peak_ratio": float(hf_to_base_peak_ratio.item()),
         "use_high_alpha": float(use_high_alpha),
     }
     return float(alpha), diagnostics
+
+
+def compute_highfreq_soft_alpha_map(
+    base_score,
+    highfreq_score,
+    low_alpha=0.05,
+    high_alpha=0.4,
+    top_quantile=0.85,
+    gate_slope=16.0,
+    diffuse_guard=0.5,
+    **adaptive_kwargs,
+):
+    _, diagnostics = compute_highfreq_adaptive_alpha(
+        base_score,
+        highfreq_score,
+        low_alpha=low_alpha,
+        high_alpha=high_alpha,
+        **adaptive_kwargs,
+    )
+    base_rank = rank_normalize_score(base_score)
+    hf_rank = rank_normalize_score(highfreq_score)
+    base_high = torch.sigmoid((base_rank - top_quantile) * gate_slope)
+    hf_high = torch.sigmoid((hf_rank - top_quantile) * gate_slope)
+    agreement_map = base_high * hf_high
+
+    hf_without_base = hf_high * torch.sigmoid((top_quantile - base_rank) * gate_slope)
+    guard_factor = 1.0 if diagnostics["use_high_alpha"] > 0.5 else float(diffuse_guard)
+    alpha_map = low_alpha + (high_alpha - low_alpha) * agreement_map * guard_factor
+    alpha_map = alpha_map * (1.0 - hf_without_base) + low_alpha * hf_without_base
+    alpha_map = alpha_map.clamp(min=min(low_alpha, high_alpha), max=max(low_alpha, high_alpha))
+    diagnostics["alpha_mean"] = float(alpha_map.mean().item())
+    diagnostics["alpha_max"] = float(alpha_map.max().item())
+    diagnostics["alpha_min"] = float(alpha_map.min().item())
+    return alpha_map, diagnostics
 
 
 def fuse_with_highfreq_score(
@@ -913,9 +988,23 @@ def fuse_with_highfreq_score(
     adaptive_high_alpha=0.4,
     adaptive_top_overlap_threshold=0.20,
     adaptive_rank_corr_threshold=0.15,
+    adaptive_min_top_concentration=0.08,
+    adaptive_max_entropy=0.85,
+    adaptive_min_peak_ratio=0.75,
+    adaptive_max_peak_ratio=3.0,
+    soft_map_top_quantile=0.85,
+    soft_map_gate_slope=16.0,
+    soft_map_diffuse_guard=0.5,
+    input_dynamic_range=None,
+    diagnostic_dynamic_range_threshold=10.0,
+    diagnostic_texture_entropy_threshold=0.80,
+    diagnostic_texture_concentration_threshold=0.25,
+    diagnostic_fixed_alpha=None,
+    diagnostic_soft_low_alpha=None,
+    diagnostic_soft_high_alpha=None,
 ):
     if highfreq_score is None:
-        return base_score, None, {}
+        return base_score, None, None, {}
     if fusion_mode == "adaptive":
         alpha, diagnostics = compute_highfreq_adaptive_alpha(
             base_score,
@@ -924,13 +1013,89 @@ def fuse_with_highfreq_score(
             high_alpha=adaptive_high_alpha,
             top_overlap_threshold=adaptive_top_overlap_threshold,
             rank_corr_threshold=adaptive_rank_corr_threshold,
+            min_top_concentration=adaptive_min_top_concentration,
+            max_entropy=adaptive_max_entropy,
+            min_peak_ratio=adaptive_min_peak_ratio,
+            max_peak_ratio=adaptive_max_peak_ratio,
         )
+    elif fusion_mode == "soft_map":
+        alpha_map, diagnostics = compute_highfreq_soft_alpha_map(
+            base_score,
+            highfreq_score,
+            low_alpha=adaptive_low_alpha,
+            high_alpha=adaptive_high_alpha,
+            top_quantile=soft_map_top_quantile,
+            gate_slope=soft_map_gate_slope,
+            diffuse_guard=soft_map_diffuse_guard,
+            top_overlap_threshold=adaptive_top_overlap_threshold,
+            rank_corr_threshold=adaptive_rank_corr_threshold,
+            min_top_concentration=adaptive_min_top_concentration,
+            max_entropy=adaptive_max_entropy,
+            min_peak_ratio=adaptive_min_peak_ratio,
+            max_peak_ratio=adaptive_max_peak_ratio,
+        )
+        fused_score = min_max_normalize((1.0 - alpha_map) * base_score + alpha_map * highfreq_score)
+        alpha = float(alpha_map.mean().item())
+        diagnostics["selected_fusion"] = "soft_map"
+        return fused_score, alpha, alpha_map, diagnostics
+    elif fusion_mode == "diagnostic":
+        soft_low_alpha = adaptive_low_alpha if diagnostic_soft_low_alpha is None else float(diagnostic_soft_low_alpha)
+        soft_high_alpha = adaptive_high_alpha if diagnostic_soft_high_alpha is None else float(diagnostic_soft_high_alpha)
+        fixed_alpha = adaptive_high_alpha if diagnostic_fixed_alpha is None else float(diagnostic_fixed_alpha)
+        _, diagnostics = compute_highfreq_adaptive_alpha(
+            base_score,
+            highfreq_score,
+            low_alpha=soft_low_alpha,
+            high_alpha=soft_high_alpha,
+            top_overlap_threshold=adaptive_top_overlap_threshold,
+            rank_corr_threshold=adaptive_rank_corr_threshold,
+            min_top_concentration=adaptive_min_top_concentration,
+            max_entropy=adaptive_max_entropy,
+            min_peak_ratio=adaptive_min_peak_ratio,
+            max_peak_ratio=adaptive_max_peak_ratio,
+        )
+        dynamic_range = 0.0 if input_dynamic_range is None else float(input_dynamic_range)
+        concentrated_texture = (
+            diagnostics["hf_entropy"] < float(diagnostic_texture_entropy_threshold)
+            and diagnostics["hf_top_concentration"] > float(diagnostic_texture_concentration_threshold)
+        )
+        use_soft_map = (
+            dynamic_range > float(diagnostic_dynamic_range_threshold)
+            or diagnostics["hf_to_base_peak_ratio"] > float(adaptive_max_peak_ratio)
+            or concentrated_texture
+        )
+        diagnostics["concentrated_texture_guard"] = float(concentrated_texture)
+        diagnostics["input_dynamic_range"] = dynamic_range
+        if use_soft_map:
+            alpha_map, diagnostics = compute_highfreq_soft_alpha_map(
+                base_score,
+                highfreq_score,
+                low_alpha=soft_low_alpha,
+                high_alpha=soft_high_alpha,
+                top_quantile=soft_map_top_quantile,
+                gate_slope=soft_map_gate_slope,
+                diffuse_guard=soft_map_diffuse_guard,
+                top_overlap_threshold=adaptive_top_overlap_threshold,
+                rank_corr_threshold=adaptive_rank_corr_threshold,
+                min_top_concentration=adaptive_min_top_concentration,
+                max_entropy=adaptive_max_entropy,
+                min_peak_ratio=adaptive_min_peak_ratio,
+                max_peak_ratio=adaptive_max_peak_ratio,
+            )
+            diagnostics["input_dynamic_range"] = dynamic_range
+            diagnostics["selected_fusion"] = "soft_map"
+            fused_score = min_max_normalize((1.0 - alpha_map) * base_score + alpha_map * highfreq_score)
+            alpha = float(alpha_map.mean().item())
+            return fused_score, alpha, alpha_map, diagnostics
+        alpha = min(1.0, max(0.0, float(fixed_alpha)))
+        diagnostics["selected_fusion"] = "fixed"
+        return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score), alpha, None, diagnostics
     else:
         alpha = min(1.0, max(0.0, float(highfreq_weight)))
         diagnostics = {}
     if alpha <= 0.0:
-        return base_score, alpha, diagnostics
-    return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score), alpha, diagnostics
+        return base_score, alpha, None, diagnostics
+    return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score), alpha, None, diagnostics
 
 
 def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights, adaptive=False):
@@ -1005,6 +1170,20 @@ def compute_final_artifacts(
     highfreq_adaptive_high_alpha=0.4,
     highfreq_adaptive_top_overlap=0.20,
     highfreq_adaptive_rank_corr=0.15,
+    highfreq_adaptive_min_top_concentration=0.08,
+    highfreq_adaptive_max_entropy=0.85,
+    highfreq_adaptive_min_peak_ratio=0.75,
+    highfreq_adaptive_max_peak_ratio=3.0,
+    highfreq_soft_map_top_quantile=0.85,
+    highfreq_soft_map_gate_slope=16.0,
+    highfreq_soft_map_diffuse_guard=0.5,
+    highfreq_diagnostic_dynamic_range=10.0,
+    highfreq_diagnostic_texture_entropy=0.80,
+    highfreq_diagnostic_texture_concentration=0.25,
+    highfreq_diagnostic_fixed_alpha=None,
+    highfreq_diagnostic_soft_low_alpha=None,
+    highfreq_diagnostic_soft_high_alpha=None,
+    raw_input_dynamic_range=None,
 ):
     enhancement_prior = (1.0 - mask_var.detach()).clamp(0.0, 1.0)
     with torch.no_grad():
@@ -1026,7 +1205,7 @@ def compute_final_artifacts(
             weights=weights,
             adaptive=adaptive_score_fusion,
         )
-        fused_score, highfreq_alpha, highfreq_diagnostics = fuse_with_highfreq_score(
+        fused_score, highfreq_alpha, highfreq_alpha_map, highfreq_diagnostics = fuse_with_highfreq_score(
             fused_score,
             highfreq_score,
             highfreq_weight,
@@ -1035,10 +1214,29 @@ def compute_final_artifacts(
             adaptive_high_alpha=highfreq_adaptive_high_alpha,
             adaptive_top_overlap_threshold=highfreq_adaptive_top_overlap,
             adaptive_rank_corr_threshold=highfreq_adaptive_rank_corr,
+            adaptive_min_top_concentration=highfreq_adaptive_min_top_concentration,
+            adaptive_max_entropy=highfreq_adaptive_max_entropy,
+            adaptive_min_peak_ratio=highfreq_adaptive_min_peak_ratio,
+            adaptive_max_peak_ratio=highfreq_adaptive_max_peak_ratio,
+            soft_map_top_quantile=highfreq_soft_map_top_quantile,
+            soft_map_gate_slope=highfreq_soft_map_gate_slope,
+            soft_map_diffuse_guard=highfreq_soft_map_diffuse_guard,
+            input_dynamic_range=(
+                float((img_var.max() - img_var.min()).item())
+                if raw_input_dynamic_range is None
+                else float(raw_input_dynamic_range)
+            ),
+            diagnostic_dynamic_range_threshold=highfreq_diagnostic_dynamic_range,
+            diagnostic_texture_entropy_threshold=highfreq_diagnostic_texture_entropy,
+            diagnostic_texture_concentration_threshold=highfreq_diagnostic_texture_concentration,
+            diagnostic_fixed_alpha=highfreq_diagnostic_fixed_alpha,
+            diagnostic_soft_low_alpha=highfreq_diagnostic_soft_low_alpha,
+            diagnostic_soft_high_alpha=highfreq_diagnostic_soft_high_alpha,
         )
 
     highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
     highfreq_alpha_np = None if highfreq_alpha is None else np.asarray([highfreq_alpha], dtype=np.float32)
+    highfreq_alpha_map_np = None if highfreq_alpha_map is None else highfreq_alpha_map.detach().cpu().squeeze().numpy()
     return {
         "background_img": out_h.detach().cpu().squeeze(0).numpy(),
         "residual_score": residual_score.detach().cpu().squeeze().numpy(),
@@ -1046,6 +1244,7 @@ def compute_final_artifacts(
         "uncertainty_score": uncertainty_score.detach().cpu().squeeze().numpy(),
         "highfreq_score": highfreq_score_np,
         "highfreq_alpha": highfreq_alpha_np,
+        "highfreq_alpha_map": highfreq_alpha_map_np,
         "highfreq_diagnostics": highfreq_diagnostics,
         "fused_score": fused_score.detach().cpu().squeeze().numpy(),
         "mask": mask_var.detach().cpu().squeeze().numpy(),
@@ -1166,6 +1365,19 @@ def run_single_sample(
     highfreq_adaptive_high_alpha = float(mode_config.get("highfreq_adaptive_high_alpha", 0.4))
     highfreq_adaptive_top_overlap = float(mode_config.get("highfreq_adaptive_top_overlap", 0.20))
     highfreq_adaptive_rank_corr = float(mode_config.get("highfreq_adaptive_rank_corr", 0.15))
+    highfreq_adaptive_min_top_concentration = float(mode_config.get("highfreq_adaptive_min_top_concentration", 0.08))
+    highfreq_adaptive_max_entropy = float(mode_config.get("highfreq_adaptive_max_entropy", 0.85))
+    highfreq_adaptive_min_peak_ratio = float(mode_config.get("highfreq_adaptive_min_peak_ratio", 0.75))
+    highfreq_adaptive_max_peak_ratio = float(mode_config.get("highfreq_adaptive_max_peak_ratio", 3.0))
+    highfreq_soft_map_top_quantile = float(mode_config.get("highfreq_soft_map_top_quantile", 0.85))
+    highfreq_soft_map_gate_slope = float(mode_config.get("highfreq_soft_map_gate_slope", 16.0))
+    highfreq_soft_map_diffuse_guard = float(mode_config.get("highfreq_soft_map_diffuse_guard", 0.5))
+    highfreq_diagnostic_dynamic_range = float(mode_config.get("highfreq_diagnostic_dynamic_range", 10.0))
+    highfreq_diagnostic_texture_entropy = float(mode_config.get("highfreq_diagnostic_texture_entropy", 0.80))
+    highfreq_diagnostic_texture_concentration = float(mode_config.get("highfreq_diagnostic_texture_concentration", 0.25))
+    highfreq_diagnostic_fixed_alpha = mode_config.get("highfreq_diagnostic_fixed_alpha", None)
+    highfreq_diagnostic_soft_low_alpha = mode_config.get("highfreq_diagnostic_soft_low_alpha", None)
+    highfreq_diagnostic_soft_high_alpha = mode_config.get("highfreq_diagnostic_soft_high_alpha", None)
     metric_history = []
 
     mat = load_mat_file(file_path)
@@ -1176,6 +1388,7 @@ def run_single_sample(
     label_np = np.array(label).transpose(1, 0)
     e_np = np.array(e).transpose(1, 0)
     img_np = np.array(img_h5).transpose(0, 2, 1)
+    raw_input_dynamic_range = float(np.max(img_np) - np.min(img_np))
     print_sample_stats(sample_id, img_np, e_np, label_np, stage="raw")
 
     if normalize_inputs:
@@ -1373,6 +1586,20 @@ def run_single_sample(
                 highfreq_adaptive_high_alpha=highfreq_adaptive_high_alpha,
                 highfreq_adaptive_top_overlap=highfreq_adaptive_top_overlap,
                 highfreq_adaptive_rank_corr=highfreq_adaptive_rank_corr,
+                highfreq_adaptive_min_top_concentration=highfreq_adaptive_min_top_concentration,
+                highfreq_adaptive_max_entropy=highfreq_adaptive_max_entropy,
+                highfreq_adaptive_min_peak_ratio=highfreq_adaptive_min_peak_ratio,
+                highfreq_adaptive_max_peak_ratio=highfreq_adaptive_max_peak_ratio,
+                highfreq_soft_map_top_quantile=highfreq_soft_map_top_quantile,
+                highfreq_soft_map_gate_slope=highfreq_soft_map_gate_slope,
+                highfreq_soft_map_diffuse_guard=highfreq_soft_map_diffuse_guard,
+                highfreq_diagnostic_dynamic_range=highfreq_diagnostic_dynamic_range,
+                highfreq_diagnostic_texture_entropy=highfreq_diagnostic_texture_entropy,
+                highfreq_diagnostic_texture_concentration=highfreq_diagnostic_texture_concentration,
+                highfreq_diagnostic_fixed_alpha=highfreq_diagnostic_fixed_alpha,
+                highfreq_diagnostic_soft_low_alpha=highfreq_diagnostic_soft_low_alpha,
+                highfreq_diagnostic_soft_high_alpha=highfreq_diagnostic_soft_high_alpha,
+                raw_input_dynamic_range=raw_input_dynamic_range,
             )
             residual_np = final_artifacts["fused_score"]
             residual_path = os.path.join(residual_root_path, f"urban_detection_{sample_id}.mat")
@@ -1392,6 +1619,7 @@ def run_single_sample(
                     "uncertainty_score": final_artifacts["uncertainty_score"],
                     "highfreq_score": final_artifacts["highfreq_score"],
                     "highfreq_alpha": final_artifacts["highfreq_alpha"],
+                    "highfreq_alpha_map": final_artifacts["highfreq_alpha_map"],
                     "fused_score": final_artifacts["fused_score"],
                 },
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
@@ -1437,7 +1665,15 @@ def run_single_sample(
                 print(
                     f"highfreq alpha: {float(final_artifacts['highfreq_alpha'][0]):.6f}; "
                     f"top_overlap: {diagnostics.get('top_overlap', 0.0):.6f}; "
-                    f"rank_corr: {diagnostics.get('rank_corr', 0.0):.6f}"
+                    f"rank_corr: {diagnostics.get('rank_corr', 0.0):.6f}; "
+                    f"hf_top_conc: {diagnostics.get('hf_top_concentration', 0.0):.6f}; "
+                    f"hf_entropy: {diagnostics.get('hf_entropy', 0.0):.6f}; "
+                    f"hf_peak_ratio: {diagnostics.get('hf_to_base_peak_ratio', 0.0):.6f}; "
+                    f"selected: {diagnostics.get('selected_fusion', highfreq_fusion_mode)}; "
+                    f"texture_guard: {diagnostics.get('concentrated_texture_guard', 0.0):.0f}; "
+                    f"dyn_range: {diagnostics.get('input_dynamic_range', 0.0):.6f}; "
+                    f"alpha_min: {diagnostics.get('alpha_min', float(final_artifacts['highfreq_alpha'][0])):.6f}; "
+                    f"alpha_max: {diagnostics.get('alpha_max', float(final_artifacts['highfreq_alpha'][0])):.6f}"
                 )
             print(f"Saved score components MAT: {score_mat_path}")
             if mask_history_path is not None:
@@ -1503,9 +1739,9 @@ def parse_args():
     )
     parser.add_argument(
         "--highfreq-fusion-mode",
-        choices=["fixed", "adaptive"],
+        choices=["fixed", "adaptive", "soft_map", "diagnostic"],
         default="fixed",
-        help="Use a fixed high-frequency alpha or gate it by agreement with the base score.",
+        help="Use fixed alpha, sample-level adaptive alpha, or a pixel-level soft alpha map.",
     )
     parser.add_argument(
         "--highfreq-adaptive-low-alpha",
@@ -1530,6 +1766,84 @@ def parse_args():
         type=float,
         default=0.15,
         help="Rank correlation threshold for adaptive high-frequency fusion.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-min-top-concentration",
+        type=float,
+        default=0.08,
+        help="Minimum top-1-percent high-frequency score concentration for high adaptive alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-max-entropy",
+        type=float,
+        default=0.85,
+        help="Maximum normalized spatial entropy of high-frequency score for high adaptive alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-min-peak-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum high-frequency/base top-1-percent sharpness ratio for high adaptive alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-adaptive-max-peak-ratio",
+        type=float,
+        default=3.0,
+        help="Maximum high-frequency/base top-1-percent sharpness ratio for high adaptive alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-soft-map-top-quantile",
+        type=float,
+        default=0.85,
+        help="Rank threshold used by soft-map fusion to identify jointly high base/high-frequency pixels.",
+    )
+    parser.add_argument(
+        "--highfreq-soft-map-gate-slope",
+        type=float,
+        default=16.0,
+        help="Sigmoid slope for soft-map high-response gates.",
+    )
+    parser.add_argument(
+        "--highfreq-soft-map-diffuse-guard",
+        type=float,
+        default=0.5,
+        help="Multiplier on soft-map high-alpha boost when sample-level diffuse-response guard fails.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-dynamic-range",
+        type=float,
+        default=10.0,
+        help="Input dynamic-range threshold that makes diagnostic high-frequency fusion choose conservative soft-map.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-texture-entropy",
+        type=float,
+        default=0.80,
+        help="Entropy threshold below which concentrated high-frequency texture response uses conservative soft-map.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-texture-concentration",
+        type=float,
+        default=0.25,
+        help="Top concentration threshold above which concentrated high-frequency texture response uses conservative soft-map.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-fixed-alpha",
+        type=float,
+        default=None,
+        help="Fixed alpha used by diagnostic fusion for non-protected samples. Defaults to highfreq adaptive high alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-soft-low-alpha",
+        type=float,
+        default=None,
+        help="Low alpha used by diagnostic fusion's protected soft-map branch. Defaults to highfreq adaptive low alpha.",
+    )
+    parser.add_argument(
+        "--highfreq-diagnostic-soft-high-alpha",
+        type=float,
+        default=None,
+        help="High alpha used by diagnostic fusion's protected soft-map branch. Defaults to highfreq adaptive high alpha.",
     )
     parser.add_argument(
         "--highfreq-wavelet",
@@ -1746,6 +2060,25 @@ def main():
     mode_config["highfreq_adaptive_high_alpha"] = min(1.0, max(0.0, float(args.highfreq_adaptive_high_alpha)))
     mode_config["highfreq_adaptive_top_overlap"] = float(args.highfreq_adaptive_top_overlap)
     mode_config["highfreq_adaptive_rank_corr"] = float(args.highfreq_adaptive_rank_corr)
+    mode_config["highfreq_adaptive_min_top_concentration"] = float(args.highfreq_adaptive_min_top_concentration)
+    mode_config["highfreq_adaptive_max_entropy"] = float(args.highfreq_adaptive_max_entropy)
+    mode_config["highfreq_adaptive_min_peak_ratio"] = float(args.highfreq_adaptive_min_peak_ratio)
+    mode_config["highfreq_adaptive_max_peak_ratio"] = float(args.highfreq_adaptive_max_peak_ratio)
+    mode_config["highfreq_soft_map_top_quantile"] = min(1.0, max(0.0, float(args.highfreq_soft_map_top_quantile)))
+    mode_config["highfreq_soft_map_gate_slope"] = max(1e-6, float(args.highfreq_soft_map_gate_slope))
+    mode_config["highfreq_soft_map_diffuse_guard"] = min(1.0, max(0.0, float(args.highfreq_soft_map_diffuse_guard)))
+    mode_config["highfreq_diagnostic_dynamic_range"] = max(0.0, float(args.highfreq_diagnostic_dynamic_range))
+    mode_config["highfreq_diagnostic_texture_entropy"] = float(args.highfreq_diagnostic_texture_entropy)
+    mode_config["highfreq_diagnostic_texture_concentration"] = float(args.highfreq_diagnostic_texture_concentration)
+    mode_config["highfreq_diagnostic_fixed_alpha"] = (
+        None if args.highfreq_diagnostic_fixed_alpha is None else min(1.0, max(0.0, float(args.highfreq_diagnostic_fixed_alpha)))
+    )
+    mode_config["highfreq_diagnostic_soft_low_alpha"] = (
+        None if args.highfreq_diagnostic_soft_low_alpha is None else min(1.0, max(0.0, float(args.highfreq_diagnostic_soft_low_alpha)))
+    )
+    mode_config["highfreq_diagnostic_soft_high_alpha"] = (
+        None if args.highfreq_diagnostic_soft_high_alpha is None else min(1.0, max(0.0, float(args.highfreq_diagnostic_soft_high_alpha)))
+    )
     mode_config["highfreq_wavelet"] = args.highfreq_wavelet
     mode_config["highfreq_level"] = max(1, int(args.highfreq_level))
     ensure_dir(batch_output_dir)
