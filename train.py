@@ -4,6 +4,7 @@ import argparse
 import csv
 import glob
 import os
+import random
 import re
 import time
 
@@ -41,6 +42,34 @@ ABLATION_MODES = {
     "sam_only": {"adaptive_mask": False, "sam_loss": True},
     "mask_sam": {"adaptive_mask": True, "sam_loss": True},
     "prior_blindspot": {"adaptive_mask": True, "sam_loss": False, "prior_mode": "consensus", "blindspot": True},
+    "sp_only": {
+        "adaptive_mask": True,
+        "sam_loss": True,
+        "prior_mode": "sp_imp",
+        "superpixel_perturb": True,
+        "online_background_mining": False,
+        "blindspot": False,
+        "num_iter": 800,
+        "sp_target_weight": 0.6,
+        "residual_weight": 0.8,
+        "contrast_weight": 0.15,
+        "uncertainty_weight": 0.05,
+        "adaptive_score_fusion": False,
+    },
+    "sp_obm": {
+        "adaptive_mask": True,
+        "sam_loss": True,
+        "prior_mode": "sp_imp",
+        "superpixel_perturb": True,
+        "online_background_mining": True,
+        "blindspot": False,
+        "num_iter": 800,
+        "sp_target_weight": 0.6,
+        "residual_weight": 0.8,
+        "contrast_weight": 0.15,
+        "uncertainty_weight": 0.05,
+        "adaptive_score_fusion": False,
+    },
     "sp_imp_dpmn": {
         "adaptive_mask": True,
         "sam_loss": True,
@@ -98,6 +127,14 @@ def save_score_components(output_dir, sample_id, score_maps, weights):
         save_data["highfreq_alpha_map"] = np.asarray(score_maps["highfreq_alpha_map"], dtype=np.float32)
     if "region_prior_score" in score_maps and score_maps["region_prior_score"] is not None:
         save_data["region_prior_score"] = np.asarray(score_maps["region_prior_score"], dtype=np.float32)
+    if "final_fusion_weights" in score_maps and score_maps["final_fusion_weights"] is not None:
+        save_data["final_fusion_weights"] = np.asarray(score_maps["final_fusion_weights"], dtype=np.float32)
+    if "uncertainty_gate_stats" in score_maps and score_maps["uncertainty_gate_stats"] is not None:
+        save_data["uncertainty_gate_stats"] = np.asarray(score_maps["uncertainty_gate_stats"], dtype=np.float32)
+    if "uncertainty_overlay_stats" in score_maps and score_maps["uncertainty_overlay_stats"] is not None:
+        save_data["uncertainty_overlay_stats"] = np.asarray(score_maps["uncertainty_overlay_stats"], dtype=np.float32)
+    if "pre_overlay_fused_score" in score_maps and score_maps["pre_overlay_fused_score"] is not None:
+        save_data["pre_overlay_fused_score"] = np.asarray(score_maps["pre_overlay_fused_score"], dtype=np.float32)
     scipy.io.savemat(mat_path, save_data)
     return mat_path
 
@@ -912,12 +949,23 @@ def compute_top_sharpness(score, top_fraction=0.01, eps=1e-8):
     return top_mean / flat.mean().clamp_min(eps)
 
 
-def should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
+def compute_uncertainty_reliability_stats(residual_score, contrast_score, uncertainty_score):
     residual_contrast_score = min_max_normalize(0.85 * residual_score + 0.15 * contrast_score)
     top_overlap = compute_top_overlap(residual_contrast_score, uncertainty_score, top_fraction=0.05)
     residual_corr = compute_rank_correlation(residual_score, uncertainty_score)
     contrast_corr = compute_rank_correlation(contrast_score, uncertainty_score)
-    return bool((top_overlap > 0.20 and residual_corr > 0.15 and contrast_corr > 0.05).item())
+    use_uncertainty = top_overlap > 0.20 and residual_corr > 0.15 and contrast_corr > 0.05
+    return {
+        "top_overlap": top_overlap,
+        "residual_corr": residual_corr,
+        "contrast_corr": contrast_corr,
+        "use_uncertainty": use_uncertainty,
+    }
+
+
+def should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
+    stats = compute_uncertainty_reliability_stats(residual_score, contrast_score, uncertainty_score)
+    return bool(stats["use_uncertainty"].item())
 
 
 def compute_stationary_haar_highfreq_score(residual_score, eps=1e-8):
@@ -1234,18 +1282,128 @@ def fuse_with_highfreq_score(
     return min_max_normalize((1.0 - alpha) * base_score + alpha * highfreq_score), alpha, None, diagnostics
 
 
-def fuse_detection_scores(residual_score, contrast_score, uncertainty_score, weights, adaptive=False):
-    if adaptive and not should_use_uncertainty_score(residual_score, contrast_score, uncertainty_score):
-        fused_score = 0.85 * residual_score + 0.15 * contrast_score
-        return min_max_normalize(fused_score)
-
+def fuse_detection_scores(
+    residual_score,
+    contrast_score,
+    uncertainty_score,
+    weights,
+    adaptive=False,
+    adaptive_uncertainty_boost=False,
+    conservative_uncertainty_overlay=False,
+    uncertainty_overlay_weight=0.10,
+    uncertainty_boost_weight=0.25,
+    uncertainty_boost_min_top_overlap=0.20,
+    uncertainty_boost_min_residual_corr=0.35,
+    uncertainty_boost_min_contrast_corr=0.10,
+    return_diagnostics=False,
+):
+    diagnostics = {
+        "uncertainty_top_overlap": 0.0,
+        "uncertainty_residual_corr": 0.0,
+        "uncertainty_contrast_corr": 0.0,
+        "uncertainty_used": 1.0,
+        "uncertainty_boosted": 0.0,
+    }
     residual_weight, contrast_weight, uncertainty_weight = weights
+    final_weights = [float(residual_weight), float(contrast_weight), float(uncertainty_weight)]
+
+    if adaptive:
+        stats = compute_uncertainty_reliability_stats(residual_score, contrast_score, uncertainty_score)
+        use_uncertainty = bool(stats["use_uncertainty"].item())
+        diagnostics.update({
+            "uncertainty_top_overlap": float(stats["top_overlap"].item()),
+            "uncertainty_residual_corr": float(stats["residual_corr"].item()),
+            "uncertainty_contrast_corr": float(stats["contrast_corr"].item()),
+            "uncertainty_used": float(use_uncertainty),
+        })
+        if not use_uncertainty:
+            fused_score = min_max_normalize(0.85 * residual_score + 0.15 * contrast_score)
+            final_weights = [0.85, 0.15, 0.0]
+            diagnostics["uncertainty_used"] = 0.0
+            if return_diagnostics:
+                return fused_score, diagnostics, final_weights
+            return fused_score
+
+        boost_ok = (
+            stats["top_overlap"] >= float(uncertainty_boost_min_top_overlap)
+            and stats["residual_corr"] >= float(uncertainty_boost_min_residual_corr)
+            and stats["contrast_corr"] >= float(uncertainty_boost_min_contrast_corr)
+        )
+        if adaptive_uncertainty_boost and bool(boost_ok.item()):
+            boosted_uncertainty = min(0.95, max(float(uncertainty_weight), float(uncertainty_boost_weight)))
+            remaining = max(0.0, 1.0 - boosted_uncertainty)
+            residual_contrast_sum = max(float(residual_weight + contrast_weight), 1e-8)
+            residual_weight = remaining * float(residual_weight) / residual_contrast_sum
+            contrast_weight = remaining * float(contrast_weight) / residual_contrast_sum
+            uncertainty_weight = boosted_uncertainty
+            final_weights = [float(residual_weight), float(contrast_weight), float(uncertainty_weight)]
+            diagnostics["uncertainty_boosted"] = 1.0
+
     fused_score = (
         residual_weight * residual_score
         + contrast_weight * contrast_score
         + uncertainty_weight * uncertainty_score
     )
-    return min_max_normalize(fused_score)
+    fused_score = min_max_normalize(fused_score)
+    if return_diagnostics:
+        return fused_score, diagnostics, final_weights
+    return fused_score
+
+
+def apply_conservative_uncertainty_overlay(
+    base_score,
+    residual_score,
+    contrast_score,
+    uncertainty_score,
+    enabled=False,
+    overlay_weight=0.10,
+    min_top_overlap=0.20,
+    min_residual_corr=0.35,
+    min_contrast_corr=0.10,
+    return_diagnostics=False,
+):
+    diagnostics = {
+        "uncertainty_overlay_top_overlap": 0.0,
+        "uncertainty_overlay_residual_corr": 0.0,
+        "uncertainty_overlay_contrast_corr": 0.0,
+        "uncertainty_overlay_enabled": float(bool(enabled)),
+        "uncertainty_overlay_applied": 0.0,
+        "uncertainty_overlay_weight": 0.0,
+    }
+    if not enabled:
+        if return_diagnostics:
+            return base_score, diagnostics
+        return base_score
+
+    stats = compute_uncertainty_reliability_stats(residual_score, contrast_score, uncertainty_score)
+    diagnostics.update({
+        "uncertainty_overlay_top_overlap": float(stats["top_overlap"].item()),
+        "uncertainty_overlay_residual_corr": float(stats["residual_corr"].item()),
+        "uncertainty_overlay_contrast_corr": float(stats["contrast_corr"].item()),
+    })
+    overlay_ok = (
+        stats["use_uncertainty"]
+        and stats["top_overlap"] >= float(min_top_overlap)
+        and stats["residual_corr"] >= float(min_residual_corr)
+        and stats["contrast_corr"] >= float(min_contrast_corr)
+    )
+    if not bool(overlay_ok.item()):
+        if return_diagnostics:
+            return base_score, diagnostics
+        return base_score
+
+    alpha = min(0.95, max(0.0, float(overlay_weight)))
+    if alpha <= 0.0:
+        if return_diagnostics:
+            return base_score, diagnostics
+        return base_score
+
+    overlaid_score = min_max_normalize((1.0 - alpha) * base_score + alpha * uncertainty_score)
+    diagnostics["uncertainty_overlay_applied"] = 1.0
+    diagnostics["uncertainty_overlay_weight"] = float(alpha)
+    if return_diagnostics:
+        return overlaid_score, diagnostics
+    return overlaid_score
 
 
 def compute_mask_guided_joint_loss(
@@ -1297,6 +1455,13 @@ def compute_final_artifacts(
     spatial_kernel,
     weights,
     adaptive_score_fusion=False,
+    adaptive_uncertainty_boost=False,
+    conservative_uncertainty_overlay=False,
+    uncertainty_overlay_weight=0.10,
+    uncertainty_boost_weight=0.25,
+    uncertainty_boost_min_top_overlap=0.20,
+    uncertainty_boost_min_residual_corr=0.35,
+    uncertainty_boost_min_contrast_corr=0.10,
     highfreq_score_mode="none",
     highfreq_weight=0.0,
     highfreq_wavelet="haar",
@@ -1341,12 +1506,18 @@ def compute_final_artifacts(
             level=highfreq_level,
         )
         edge_score = compute_input_edge_score(img_var) if highfreq_edge_guard else None
-        fused_score = fuse_detection_scores(
+        fused_score, uncertainty_diagnostics, final_fusion_weights = fuse_detection_scores(
             residual_score,
             contrast_score,
             uncertainty_score,
             weights=weights,
             adaptive=adaptive_score_fusion,
+            adaptive_uncertainty_boost=adaptive_uncertainty_boost,
+            uncertainty_boost_weight=uncertainty_boost_weight,
+            uncertainty_boost_min_top_overlap=uncertainty_boost_min_top_overlap,
+            uncertainty_boost_min_residual_corr=uncertainty_boost_min_residual_corr,
+            uncertainty_boost_min_contrast_corr=uncertainty_boost_min_contrast_corr,
+            return_diagnostics=True,
         )
         region_prior_score = compute_superpixel_region_prior(
             residual_score,
@@ -1391,6 +1562,19 @@ def compute_final_artifacts(
             alpha = min(1.0, max(0.0, float(region_prior_weight)))
             fused_score = min_max_normalize((1.0 - alpha) * fused_score + alpha * region_prior_score)
             highfreq_diagnostics["region_prior_alpha"] = float(alpha)
+        pre_overlay_fused_score = fused_score
+        fused_score, uncertainty_overlay_diagnostics = apply_conservative_uncertainty_overlay(
+            fused_score,
+            residual_score,
+            contrast_score,
+            uncertainty_score,
+            enabled=conservative_uncertainty_overlay,
+            overlay_weight=uncertainty_overlay_weight,
+            min_top_overlap=uncertainty_boost_min_top_overlap,
+            min_residual_corr=uncertainty_boost_min_residual_corr,
+            min_contrast_corr=uncertainty_boost_min_contrast_corr,
+            return_diagnostics=True,
+        )
 
     highfreq_score_np = None if highfreq_score is None else highfreq_score.detach().cpu().squeeze().numpy()
     highfreq_alpha_np = None if highfreq_alpha is None else np.asarray([highfreq_alpha], dtype=np.float32)
@@ -1406,6 +1590,10 @@ def compute_final_artifacts(
         "highfreq_alpha_map": highfreq_alpha_map_np,
         "region_prior_score": region_prior_np,
         "highfreq_diagnostics": highfreq_diagnostics,
+        "uncertainty_diagnostics": uncertainty_diagnostics,
+        "uncertainty_overlay_diagnostics": uncertainty_overlay_diagnostics,
+        "final_fusion_weights": np.asarray(final_fusion_weights, dtype=np.float32),
+        "pre_overlay_fused_score": pre_overlay_fused_score.detach().cpu().squeeze().numpy(),
         "fused_score": fused_score.detach().cpu().squeeze().numpy(),
         "mask": mask_var.detach().cpu().squeeze().numpy(),
     }
@@ -1546,6 +1734,14 @@ def run_single_sample(
     superpixel_compactness = float(mode_config.get("superpixel_compactness", 0.08))
     sp_target_weight = float(mode_config.get("sp_target_weight", 1.0))
     adaptive_score_fusion = bool(mode_config.get("adaptive_score_fusion", False))
+    adaptive_uncertainty_boost = bool(mode_config.get("adaptive_uncertainty_boost", False))
+    training_uncertainty_boost = bool(mode_config.get("training_uncertainty_boost", False))
+    conservative_uncertainty_overlay = bool(mode_config.get("conservative_uncertainty_overlay", False))
+    uncertainty_overlay_weight = float(mode_config.get("uncertainty_overlay_weight", 0.10))
+    uncertainty_boost_weight = float(mode_config.get("uncertainty_boost_weight", 0.25))
+    uncertainty_boost_min_top_overlap = float(mode_config.get("uncertainty_boost_min_top_overlap", 0.20))
+    uncertainty_boost_min_residual_corr = float(mode_config.get("uncertainty_boost_min_residual_corr", 0.35))
+    uncertainty_boost_min_contrast_corr = float(mode_config.get("uncertainty_boost_min_contrast_corr", 0.10))
     highfreq_score_mode = mode_config.get("highfreq_score_mode", "none")
     highfreq_weight = float(mode_config.get("highfreq_weight", 0.0))
     highfreq_wavelet = mode_config.get("highfreq_wavelet", "haar")
@@ -1757,6 +1953,11 @@ def run_single_sample(
             uncertainty_score,
             weights=(residual_weight, contrast_weight, uncertainty_weight),
             adaptive=adaptive_score_fusion,
+            adaptive_uncertainty_boost=training_uncertainty_boost,
+            uncertainty_boost_weight=uncertainty_boost_weight,
+            uncertainty_boost_min_top_overlap=uncertainty_boost_min_top_overlap,
+            uncertainty_boost_min_residual_corr=uncertainty_boost_min_residual_corr,
+            uncertainty_boost_min_contrast_corr=uncertainty_boost_min_contrast_corr,
         )
         residual_var_clone = fused_score.detach().squeeze(0).squeeze(0)
         total_loss.requires_grad_(True)
@@ -1808,6 +2009,13 @@ def run_single_sample(
                 spatial_kernel,
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
                 adaptive_score_fusion=adaptive_score_fusion,
+                adaptive_uncertainty_boost=adaptive_uncertainty_boost,
+                conservative_uncertainty_overlay=conservative_uncertainty_overlay,
+                uncertainty_overlay_weight=uncertainty_overlay_weight,
+                uncertainty_boost_weight=uncertainty_boost_weight,
+                uncertainty_boost_min_top_overlap=uncertainty_boost_min_top_overlap,
+                uncertainty_boost_min_residual_corr=uncertainty_boost_min_residual_corr,
+                uncertainty_boost_min_contrast_corr=uncertainty_boost_min_contrast_corr,
                 highfreq_score_mode=highfreq_score_mode,
                 highfreq_weight=highfreq_weight,
                 highfreq_wavelet=highfreq_wavelet,
@@ -1858,6 +2066,23 @@ def run_single_sample(
                     "highfreq_alpha": final_artifacts["highfreq_alpha"],
                     "highfreq_alpha_map": final_artifacts["highfreq_alpha_map"],
                     "region_prior_score": final_artifacts["region_prior_score"],
+                    "final_fusion_weights": final_artifacts["final_fusion_weights"],
+                    "uncertainty_gate_stats": [
+                        final_artifacts["uncertainty_diagnostics"].get("uncertainty_top_overlap", 0.0),
+                        final_artifacts["uncertainty_diagnostics"].get("uncertainty_residual_corr", 0.0),
+                        final_artifacts["uncertainty_diagnostics"].get("uncertainty_contrast_corr", 0.0),
+                        final_artifacts["uncertainty_diagnostics"].get("uncertainty_used", 0.0),
+                        final_artifacts["uncertainty_diagnostics"].get("uncertainty_boosted", 0.0),
+                    ],
+                    "uncertainty_overlay_stats": [
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_top_overlap", 0.0),
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_residual_corr", 0.0),
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_contrast_corr", 0.0),
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_enabled", 0.0),
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_applied", 0.0),
+                        final_artifacts["uncertainty_overlay_diagnostics"].get("uncertainty_overlay_weight", 0.0),
+                    ],
+                    "pre_overlay_fused_score": final_artifacts["pre_overlay_fused_score"],
                     "fused_score": final_artifacts["fused_score"],
                 },
                 weights=(residual_weight, contrast_weight, uncertainty_weight),
@@ -1914,6 +2139,15 @@ def run_single_sample(
                     f"alpha_min: {diagnostics.get('alpha_min', float(final_artifacts['highfreq_alpha'][0])):.6f}; "
                     f"alpha_max: {diagnostics.get('alpha_max', float(final_artifacts['highfreq_alpha'][0])):.6f}"
                 )
+            overlay_diagnostics = final_artifacts.get("uncertainty_overlay_diagnostics", {})
+            if overlay_diagnostics.get("uncertainty_overlay_enabled", 0.0):
+                print(
+                    f"uncertainty overlay applied: {overlay_diagnostics.get('uncertainty_overlay_applied', 0.0):.0f}; "
+                    f"weight: {overlay_diagnostics.get('uncertainty_overlay_weight', 0.0):.6f}; "
+                    f"top_overlap: {overlay_diagnostics.get('uncertainty_overlay_top_overlap', 0.0):.6f}; "
+                    f"residual_corr: {overlay_diagnostics.get('uncertainty_overlay_residual_corr', 0.0):.6f}; "
+                    f"contrast_corr: {overlay_diagnostics.get('uncertainty_overlay_contrast_corr', 0.0):.6f}"
+                )
             print(f"Saved score components MAT: {score_mat_path}")
             if mask_history_path is not None:
                 print(f"Saved mask history MAT: {mask_history_path}")
@@ -1963,6 +2197,57 @@ def parse_args():
         type=float,
         default=None,
         help="Weight of abundance uncertainty in the fused anomaly map.",
+    )
+    parser.add_argument(
+        "--adaptive-uncertainty-boost",
+        action="store_true",
+        help="When adaptive score fusion accepts uncertainty, boost its final-score weight using label-free reliability gates.",
+    )
+    parser.add_argument(
+        "--conservative-uncertainty-overlay",
+        action="store_true",
+        help="After normal final scoring, apply a small uncertainty overlay only when strict label-free agreement gates pass.",
+    )
+    parser.add_argument(
+        "--uncertainty-overlay-weight",
+        type=float,
+        default=0.10,
+        help="Small final-score overlay weight used by --conservative-uncertainty-overlay after strict agreement gates pass.",
+    )
+    parser.add_argument(
+        "--uncertainty-boost-weight",
+        type=float,
+        default=0.25,
+        help="Target uncertainty weight used by --adaptive-uncertainty-boost after reliability gating passes.",
+    )
+    parser.add_argument(
+        "--training-uncertainty-boost",
+        action="store_true",
+        help="Also apply reliability-gated uncertainty boost to the training-time fused score used by multi-directional suppression.",
+    )
+    parser.add_argument(
+        "--uncertainty-boost-min-top-overlap",
+        type=float,
+        default=0.20,
+        help="Minimum top-overlap required before --adaptive-uncertainty-boost raises uncertainty weight.",
+    )
+    parser.add_argument(
+        "--uncertainty-boost-min-residual-corr",
+        type=float,
+        default=0.35,
+        help="Minimum residual/uncertainty rank correlation required before uncertainty boosting.",
+    )
+    parser.add_argument(
+        "--uncertainty-boost-min-contrast-corr",
+        type=float,
+        default=0.10,
+        help="Minimum contrast/uncertainty rank correlation required before uncertainty boosting.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for targeted reproducibility checks. Leave unset to preserve historical behavior.",
     )
     parser.add_argument(
         "--highfreq-score-mode",
@@ -2325,6 +2610,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.random_seed is not None:
+        random.seed(int(args.random_seed))
+        np.random.seed(int(args.random_seed))
+        torch.manual_seed(int(args.random_seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(args.random_seed))
     dataset_dir = args.dataset_dir
     batch_output_dir = args.results_dir or os.path.join(BASE_DIR, "results")
     visualization_dir = os.path.join(batch_output_dir, "training_curves")
@@ -2377,6 +2668,14 @@ def main():
     mode_config["residual_weight"] = residual_weight / weight_sum
     mode_config["contrast_weight"] = contrast_weight / weight_sum
     mode_config["uncertainty_weight"] = uncertainty_weight / weight_sum
+    mode_config["adaptive_uncertainty_boost"] = bool(args.adaptive_uncertainty_boost)
+    mode_config["training_uncertainty_boost"] = bool(args.training_uncertainty_boost)
+    mode_config["conservative_uncertainty_overlay"] = bool(args.conservative_uncertainty_overlay)
+    mode_config["uncertainty_overlay_weight"] = min(0.95, max(0.0, float(args.uncertainty_overlay_weight)))
+    mode_config["uncertainty_boost_weight"] = min(0.95, max(0.0, float(args.uncertainty_boost_weight)))
+    mode_config["uncertainty_boost_min_top_overlap"] = min(1.0, max(0.0, float(args.uncertainty_boost_min_top_overlap)))
+    mode_config["uncertainty_boost_min_residual_corr"] = float(args.uncertainty_boost_min_residual_corr)
+    mode_config["uncertainty_boost_min_contrast_corr"] = float(args.uncertainty_boost_min_contrast_corr)
     mode_config["highfreq_score_mode"] = args.highfreq_score_mode
     mode_config["highfreq_weight"] = min(1.0, max(0.0, float(args.highfreq_weight)))
     mode_config["highfreq_fusion_mode"] = args.highfreq_fusion_mode

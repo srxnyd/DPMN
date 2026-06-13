@@ -3122,3 +3122,76 @@ Next reasonable paper-facing direction:
   keep EAC and region prior as negative ablation evidence or future-work notes.
 ```
 
+## 2026-06-14: full ablation completion and final existing-method decision
+
+This section supersedes the earlier mixed "Final retained setting" command that combined
+`--multidir-suppression` with high-frequency diagnostic flags. The latest controlled full
+15-sample ablation shows that the final existing-method mainline should be MD-only on top of
+SP-IMP-DPMN/adaptive fusion, without the high-frequency diagnostic branch.
+
+Completed full 15-sample ablations:
+
+```text
+baseline:               mean_auc=0.949646376529, abu_beach_2=0.907725662340, abu_urban_2=0.987075803994
+mask_sam:               mean_auc=0.940879525839, abu_beach_2=0.908014668583, abu_urban_2=0.999344025951
+sp_only:                mean_auc=0.922499903785, abu_beach_2=0.848679463782, abu_urban_2=0.872942217271
+sp_obm:                 mean_auc=0.921017903552, abu_beach_2=0.846024345239, abu_urban_2=0.872058192303
+sp_obm_adaptive_fusion: mean_auc=0.939775035950, abu_beach_2=0.863029230051, abu_urban_2=0.993923229411
+sp_obm_md:              mean_auc=0.958119941153, abu_beach_2=0.866870436278, abu_urban_2=0.994053637838
+sp_obm_hf_diag:         mean_auc=0.957551813119, abu_beach_2=0.853102977169, abu_urban_2=0.994495977981
+sp_obm_md_hf_diag:      mean_auc=0.955963412793, abu_beach_2=0.820634742592, abu_urban_2=0.997206376251
+```
+
+Final existing-method recommendation:
+
+```text
+python train.py \
+  --ablation-mode sp_imp_dpmn \
+  --results-dir results_sp_imp_dpmn_md_only_full15 \
+  --multidir-suppression \
+  --num-iter 800
+```
+
+If exact reproducibility against the latest Goal-mode full ablation convention is desired, add:
+
+```text
+--random-seed 0
+```
+
+Main conclusions:
+
+```text
+1. Superpixel perturbation alone is not enough:
+   sp_only full mean_auc = 0.922499903785.
+
+2. Online background mining alone is not enough:
+   sp_obm full mean_auc = 0.921017903552.
+
+3. Adaptive score fusion is necessary for uncertainty-heavy urban scenes:
+   abu_urban_2 improves from about 0.872 in sp_only/sp_obm to 0.993923 in sp_obm_adaptive_fusion.
+
+4. Multidirectional suppression is the strongest validated existing module:
+   sp_obm_md full mean_auc = 0.958119941153, the best full 15-sample result currently recorded.
+
+5. High-frequency diagnostic fusion is useful as an auxiliary ablation, but not as the final method:
+   sp_obm_hf_diag is close in mean_auc, but weaker on abu_beach_2.
+   sp_obm_md_hf_diag improves some samples but drops abu_beach_2 to 0.820634742592.
+```
+
+Recommended paper narrative:
+
+```text
+The final method should be described as Anti-Identity SP-IMP-DPMN with online background
+mining, reliability-aware adaptive score fusion, and multidirectional anomaly suppression.
+The high-frequency diagnostic branch should be reported as an ablation/diagnostic attempt,
+not part of the final method.
+```
+
+Remaining weakness:
+
+```text
+abu_beach_2 remains the principal failure case. The best full mean method reaches only
+0.866870436278 on this sample, while historical baseline/mask_sam are around 0.908.
+Future work should focus on this sample class, but the current run deliberately stopped
+adding new modules and finalized existing-method ablations.
+```
